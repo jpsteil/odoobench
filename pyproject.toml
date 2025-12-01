@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "odoobench"
+dynamic = ["version"]
+description = "A comprehensive backup and restore utility for Odoo instances"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Jim Steil", email = "jim@steilonline.com"},
+]
+keywords = ["odoo", "backup", "restore", "database", "postgresql", "benchmark"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "Topic :: System :: Archiving :: Backup",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "cryptography>=41.0.0",
+    "paramiko>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+    "build>=0.10.0",
+    "twine>=4.0.0",
+]
+
+[project.scripts]
+odoobench = "odoobench.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/jpsteil/odoobench"
+Documentation = "https://github.com/jpsteil/odoobench#readme"
+"Bug Tracker" = "https://github.com/jpsteil/odoobench/issues"
+Repository = "https://github.com/jpsteil/odoobench"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["odoobench*"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.dynamic]
+version = {attr = "odoobench.version.__version__"}
+
+[tool.setuptools.package-data]
+odoobench = ["py.typed"]

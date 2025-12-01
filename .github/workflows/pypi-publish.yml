@@ -1,0 +1,52 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+  id-token: write   # required for PyPI Trusted Publishing (OIDC)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Debug checkout
+        run: |
+          echo "Git ref: ${{ github.ref }}"
+          echo "Git ref name: ${{ github.ref_name }}"
+          echo "Current commit: $(git rev-parse HEAD)"
+          echo "Current version in setup.py:"
+          grep "version=" setup.py || echo "setup.py not found"
+          echo "Current version in __init__.py:"
+          grep "__version__" odoobench/__init__.py || echo "__init__.py not found"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Verify metadata (twine check)
+        run: python -m twine check dist/*
+
+      # --- Publish to PyPI ---
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          verbose: true
