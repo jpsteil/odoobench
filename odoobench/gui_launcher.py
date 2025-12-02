@@ -10,10 +10,10 @@ def main():
     """Launch the GUI interface"""
     try:
         import tkinter as tk
-        from .gui.main_window import OdooBackupRestoreGUI
+        from .gui.main_window import OdooBenchGUI
 
         root = tk.Tk()
-        app = OdooBackupRestoreGUI(root)
+        app = OdooBenchGUI(root)
         root.mainloop()
 
     except ImportError as e:

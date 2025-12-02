@@ -201,7 +201,7 @@ Examples:
 
 def handle_cli(parser, args):
     """Handle CLI-specific logic"""
-    from .core.backup_restore import OdooBackupRestore
+    from .core.backup_restore import OdooBench
     from .db.connection_manager import ConnectionManager
     from .utils.config import Config
 
@@ -236,10 +236,10 @@ def launch_gui():
     """Launch the GUI interface"""
     try:
         import tkinter as tk
-        from .gui.main_window import OdooBackupRestoreGUI
+        from .gui.main_window import OdooBenchGUI
 
         root = tk.Tk()
-        app = OdooBackupRestoreGUI(root)
+        app = OdooBenchGUI(root)
         root.mainloop()
     except ImportError as e:
         print("Error: GUI dependencies not available.")
@@ -251,7 +251,7 @@ def launch_gui():
 
 def handle_backup(args):
     """Handle backup command"""
-    from .core.backup_restore import OdooBackupRestore
+    from .core.backup_restore import OdooBench
     from .db.connection_manager import ConnectionManager
     from .utils.config import Config
 
@@ -316,7 +316,7 @@ def handle_backup(args):
 
     # Perform backup
     try:
-        backup_restore = OdooBackupRestore()
+        backup_restore = OdooBench()
         backup_file = backup_restore.backup(backup_config)
         print(f"Backup completed successfully: {backup_file}")
     except Exception as e:
@@ -326,7 +326,7 @@ def handle_backup(args):
 
 def handle_restore(args):
     """Handle restore command"""
-    from .core.backup_restore import OdooBackupRestore
+    from .core.backup_restore import OdooBench
     from .db.connection_manager import ConnectionManager
 
     conn_manager = ConnectionManager()
@@ -402,7 +402,7 @@ def handle_restore(args):
 
     # Perform restore
     try:
-        backup_restore = OdooBackupRestore()
+        backup_restore = OdooBench()
         success = backup_restore.restore(restore_config, args.file)
         if success:
             print(f"Restore completed successfully to database: {restore_config['db_name']}")
@@ -517,7 +517,7 @@ def handle_connections(args):
 
 def handle_from_config(args):
     """Handle operations from odoo.conf file"""
-    from .core.backup_restore import OdooBackupRestore
+    from .core.backup_restore import OdooBench
     from .utils.config import Config
 
     config_file = Path(args.config_file)
@@ -557,7 +557,7 @@ def handle_from_config(args):
         print(f"Creating backup from config: {args.config_file}")
         print(f"Database: {backup_config['db_name']}")
         try:
-            backup_restore = OdooBackupRestore()
+            backup_restore = OdooBench()
             backup_file = backup_restore.backup(backup_config)
             print(f"Backup completed successfully: {backup_file}")
         except Exception as e:

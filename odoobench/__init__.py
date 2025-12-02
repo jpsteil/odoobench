@@ -6,7 +6,7 @@ from .version import __version__
 
 __author__ = "Jim Steil"
 
-from .core.backup_restore import OdooBackupRestore
+from .core.backup_restore import OdooBench
 from .db.connection_manager import ConnectionManager
 
-__all__ = ["OdooBackupRestore", "ConnectionManager", "__version__"]
+__all__ = ["OdooBench", "ConnectionManager", "__version__"]

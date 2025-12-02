@@ -14,12 +14,12 @@ import socket
 import paramiko
 import configparser
 
-from ..core.backup_restore import OdooBackupRestore
+from ..core.backup_restore import OdooBench
 from ..db.connection_manager import ConnectionManager
 from ..version import __version__
 
-class OdooBackupRestoreGUI:
-    """GUI interface for Odoo Backup/Restore - only loaded if tkinter is available"""
+class OdooBenchGUI:
+    """GUI interface for OdooBench - only loaded if tkinter is available"""
 
     def __init__(self, root):
         self.root = root
@@ -62,6 +62,9 @@ class OdooBackupRestoreGUI:
 
         # Re-apply theme to all widgets after they're created
         self._apply_theme_to_widgets()
+
+        # Check for updates in background
+        self.root.after(500, self._check_for_updates)
     
     def auto_size_window(self):
         """Auto-size the window to fit its content nicely and center on primary monitor"""
@@ -265,6 +268,76 @@ class OdooBackupRestoreGUI:
 
         for child in widget.winfo_children():
             self._configure_widgets_recursive(child, bg, fg, select_bg, menu_bg)
+
+    def _check_for_updates(self):
+        """Check for updates in background."""
+        from ..version import check_for_updates, __version__
+
+        def on_update_check(has_update, latest_version):
+            if has_update:
+                self.root.after(0, lambda: self._show_update_dialog(latest_version))
+
+        check_for_updates(on_update_check)
+
+    def _show_update_dialog(self, latest_version):
+        """Show update available dialog."""
+        from ..version import __version__
+
+        result = messagebox.askyesno(
+            "Update Available",
+            f"A new version of OdooBench is available.\n\n"
+            f"Installed: {__version__}\n"
+            f"Latest: {latest_version}\n\n"
+            f"Would you like to upgrade now?\n\n"
+            f"(This will run: pip install --upgrade odoobench)"
+        )
+
+        if result:
+            self._run_upgrade()
+
+    def _run_upgrade(self):
+        """Run pip upgrade in background."""
+        import subprocess
+
+        def do_upgrade():
+            try:
+                # Try pipx first, fall back to pip
+                try:
+                    result = subprocess.run(
+                        ["pipx", "upgrade", "odoobench"],
+                        capture_output=True,
+                        text=True
+                    )
+                except FileNotFoundError:
+                    # pipx not found, try pip
+                    result = subprocess.run(
+                        ["pip", "install", "--upgrade", "odoobench"],
+                        capture_output=True,
+                        text=True
+                    )
+
+                if result.returncode == 0:
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "Upgrade Complete",
+                        "OdooBench has been upgraded.\n\n"
+                        "Please restart the application to use the new version."
+                    ))
+                else:
+                    error = result.stderr or result.stdout or "Unknown error"
+                    self.root.after(0, lambda: messagebox.showerror(
+                        "Upgrade Failed",
+                        f"Failed to upgrade:\n{error}"
+                    ))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Upgrade Failed",
+                    f"Failed to upgrade:\n{e}\n\n"
+                    "Please upgrade manually:\n"
+                    "pip install --upgrade odoobench"
+                ))
+
+        thread = threading.Thread(target=do_upgrade, daemon=True)
+        thread.start()
 
     def setup_dialog_bindings(self, dialog, cancel_command=None, accept_command=None, first_field=None):
         """Setup standard keyboard bindings for dialogs
@@ -1290,7 +1363,7 @@ https://github.com/jpsteil/odoo-backup-manager
             
             try:
                 # Parse the config file
-                config = OdooBackupRestore.parse_odoo_conf(conf_file)
+                config = OdooBench.parse_odoo_conf(conf_file)
                 
                 # Update the form fields
                 fields["host"].delete(0, tk.END)
@@ -1625,7 +1698,7 @@ https://github.com/jpsteil/odoo-backup-manager
             "ssh_connection_id": ssh_conn_id
         }
 
-        tool = OdooBackupRestore(conn_manager=self.conn_manager)
+        tool = OdooBench(conn_manager=self.conn_manager)
         success, msg = tool.test_connection(config)
 
         messagebox.showinfo("Test Results", msg)
@@ -2225,7 +2298,7 @@ https://github.com/jpsteil/odoo-backup-manager
             # Get connection and test it using ID
             conn = self.conn_manager.get_odoo_connection(conn_id)
             if conn:
-                tool = OdooBackupRestore(conn_manager=self.conn_manager)
+                tool = OdooBench(conn_manager=self.conn_manager)
                 config = {
                     "db_host": conn.get("host"),
                     "db_port": conn.get("port"),
@@ -2630,7 +2703,7 @@ https://github.com/jpsteil/odoo-backup-manager
             "db_name": conn["database"],
         }
 
-        tool = OdooBackupRestore(conn_manager=self.conn_manager)
+        tool = OdooBench(conn_manager=self.conn_manager)
         success, msg = tool.test_connection(config)
 
         if success:
@@ -2715,7 +2788,7 @@ https://github.com/jpsteil/odoo-backup-manager
             try:
                 self.log_message("Starting backup operation...", "info")
                 # Create tool with callbacks
-                tool = OdooBackupRestore(
+                tool = OdooBench(
                     progress_callback=lambda val, msg: self.update_progress(val, msg),
                     log_callback=lambda msg, level: self.log_message(msg, level),
                     conn_manager=self.conn_manager
@@ -2918,7 +2991,7 @@ https://github.com/jpsteil/odoo-backup-manager
             try:
                 self.log_message("Starting restore operation...", "info")
                 # Create tool with callbacks
-                tool = OdooBackupRestore(
+                tool = OdooBench(
                     progress_callback=lambda val, msg: self.update_progress(val, msg),
                     log_callback=lambda msg, level: self.log_message(msg, level),
                     conn_manager=self.conn_manager
@@ -3042,7 +3115,7 @@ https://github.com/jpsteil/odoo-backup-manager
     def run_backup_restore(self, source_config, dest_config):
         """Run backup and restore in thread"""
         try:
-            tool = OdooBackupRestore(
+            tool = OdooBench(
                 progress_callback=lambda v, m: self.root.after(
                     0, self.update_progress, v, m
                 ),

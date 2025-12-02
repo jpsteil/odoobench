@@ -17,7 +17,7 @@ from pathlib import Path
 import paramiko
 
 
-class OdooBackupRestore:
+class OdooBench:
     """Main class for Odoo backup and restore operations"""
 
     def __init__(self, progress_callback=None, log_callback=None, conn_manager=None):
