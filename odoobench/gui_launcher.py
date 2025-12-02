@@ -12,7 +12,9 @@ def main():
         import tkinter as tk
         from .gui.main_window import OdooBenchGUI
 
-        root = tk.Tk()
+        # Set className for proper window manager integration (Linux/X11)
+        # This makes the app icon show correctly in GNOME overview
+        root = tk.Tk(className="odoobench")
         app = OdooBenchGUI(root)
         root.mainloop()
 
