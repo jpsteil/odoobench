@@ -144,3 +144,7 @@ Thumbs.db
 *.tar.gz
 *.zip
 backups/
+*.sqlite
+*.sqlite3
+*.db
+connections.db
