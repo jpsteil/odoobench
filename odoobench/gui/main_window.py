@@ -1584,11 +1584,14 @@ https://github.com/jpsteil/odoo-backup-manager
             # Add buttons for pre-selected case
             btn_frame = ttk.Frame(ssh_dialog)
             btn_frame.grid(row=1, column=0, columnspan=2, pady=20)
-            
-            ttk.Button(btn_frame, text="Connect & Load", 
+
+            ttk.Button(btn_frame, text="Connect & Load",
                       command=lambda: connect_and_load()).pack(side="left", padx=5)
-            ttk.Button(btn_frame, text="Cancel", 
+            ttk.Button(btn_frame, text="Cancel",
                       command=ssh_dialog.destroy).pack(side="left", padx=5)
+
+            # Apply theme (bindings added after connect_and_load is defined)
+            self._apply_theme_to_dialog(ssh_dialog)
         else:
             # No pre-selected SSH, show both fields
             ssh_dialog.geometry("400x150")
@@ -1628,12 +1631,15 @@ https://github.com/jpsteil/odoo-backup-manager
             # Add buttons for non-pre-selected case
             btn_frame = ttk.Frame(ssh_dialog)
             btn_frame.grid(row=row + 1, column=0, columnspan=2, pady=20)
-            
-            ttk.Button(btn_frame, text="Connect & Load", 
+
+            ttk.Button(btn_frame, text="Connect & Load",
                       command=lambda: connect_and_load()).pack(side="left", padx=5)
-            ttk.Button(btn_frame, text="Cancel", 
+            ttk.Button(btn_frame, text="Cancel",
                       command=ssh_dialog.destroy).pack(side="left", padx=5)
-        
+
+            # Apply theme
+            self._apply_theme_to_dialog(ssh_dialog)
+
         def connect_and_load():
             try:
                 # Get selected SSH connection
@@ -1756,7 +1762,12 @@ https://github.com/jpsteil/odoo-backup-manager
                 
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load remote config: {str(e)}")
-    
+
+        # Add keyboard bindings (after connect_and_load is defined)
+        ssh_dialog.bind('<Escape>', lambda e: ssh_dialog.destroy())
+        ssh_dialog.bind('<Return>', lambda e: connect_and_load())
+        ssh_fields["config_path"].focus_set()
+
     def test_connection_config(self, fields):
         """Test connection from config fields"""
         # First test SSH connection if enabled
@@ -2010,12 +2021,13 @@ https://github.com/jpsteil/odoo-backup-manager
         ttk.Button(btn_frame, text="Save", command=save_ssh_connection).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side="left", padx=5)
         
-        # Setup keyboard bindings and focus
+        # Apply theme and setup keyboard bindings
+        self._apply_theme_to_dialog(dialog)
         self.setup_dialog_bindings(dialog,
                                  cancel_command=dialog.destroy,
                                  accept_command=save_ssh_connection,
                                  first_field=fields["name"])
-    
+
     def edit_odoo_connection(self):
         """Edit selected Odoo connection"""
         selection = self.odoo_tree.selection()
@@ -2392,13 +2404,14 @@ https://github.com/jpsteil/odoo-backup-manager
         ttk.Button(btn_frame, text="Test SSH", command=lambda: self.test_ssh_from_dialog(fields)).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="Save", command=save_ssh_connection).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side="left", padx=5)
-        
-        # Setup keyboard bindings and focus
+
+        # Apply theme and setup keyboard bindings
+        self._apply_theme_to_dialog(dialog)
         self.setup_dialog_bindings(dialog,
                                  cancel_command=dialog.destroy,
                                  accept_command=save_ssh_connection,
                                  first_field=fields["name"])
-    
+
     def delete_odoo_connection(self):
         """Delete selected Odoo connection"""
         selection = self.odoo_tree.selection()
