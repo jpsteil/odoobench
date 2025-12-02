@@ -339,6 +339,43 @@ class OdooBenchGUI:
         thread = threading.Thread(target=do_upgrade, daemon=True)
         thread.start()
 
+    def _install_launcher(self):
+        """Install desktop launcher for the current OS."""
+        from ..launcher import create_launcher
+        try:
+            success = create_launcher()
+            if success:
+                messagebox.showinfo(
+                    "Launcher Installed",
+                    "Desktop launcher installed successfully.\n\n"
+                    "You may need to log out and back in for it to appear."
+                )
+            else:
+                messagebox.showwarning(
+                    "Launcher Not Installed",
+                    "Could not install desktop launcher for this operating system."
+                )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to install launcher:\n{e}")
+
+    def _remove_launcher(self):
+        """Remove desktop launcher for the current OS."""
+        from ..launcher import remove_launcher
+        try:
+            success = remove_launcher()
+            if success:
+                messagebox.showinfo(
+                    "Launcher Removed",
+                    "Desktop launcher removed successfully."
+                )
+            else:
+                messagebox.showinfo(
+                    "No Launcher Found",
+                    "No desktop launcher was found to remove."
+                )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to remove launcher:\n{e}")
+
     def setup_dialog_bindings(self, dialog, cancel_command=None, accept_command=None, first_field=None):
         """Setup standard keyboard bindings for dialogs
         
@@ -615,6 +652,22 @@ class OdooBenchGUI:
             variable=self.dark_mode_var,
             command=self._toggle_dark_mode
         ).pack(side="left", padx=(0, 10))
+
+        # Desktop Launcher buttons
+        launcher_frame = ttk.Frame(settings_frame)
+        launcher_frame.pack(fill="x", pady=5)
+
+        ttk.Label(launcher_frame, text="Desktop Launcher:").pack(side="left", padx=(0, 10))
+        ttk.Button(
+            launcher_frame,
+            text="Install Launcher",
+            command=self._install_launcher
+        ).pack(side="left", padx=(0, 5))
+        ttk.Button(
+            launcher_frame,
+            text="Remove Launcher",
+            command=self._remove_launcher
+        ).pack(side="left")
 
         # Create PanedWindow for two sections
         paned = ttk.PanedWindow(main_container, orient="vertical")
