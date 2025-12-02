@@ -132,22 +132,25 @@ class OdooBench:
             env["PGPASSWORD"] = config["db_password"]
 
         try:
+            # Build connection string with timeout
+            host = config.get("db_host") or "localhost"
+            port = config.get("db_port") or 5432
+            user = config.get("db_user") or "odoo"
+
             cmd = [
                 "psql",
-                "-h",
-                config["db_host"],
-                "-p",
-                str(config["db_port"]),
-                "-U",
-                config["db_user"],
-                "-d",
-                "postgres",
-                "-c",
-                "SELECT version();",
+                "-h", host,
+                "-p", str(port),
+                "-U", user,
+                "-d", "postgres",
+                "-c", "SELECT version();",
             ]
 
+            # Add connection timeout via environment
+            env["PGCONNECT_TIMEOUT"] = "5"
+
             result = subprocess.run(
-                cmd, env=env, capture_output=True, text=True, timeout=5
+                cmd, env=env, capture_output=True, text=True, timeout=10
             )
 
             if result.returncode == 0:

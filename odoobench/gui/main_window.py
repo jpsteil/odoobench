@@ -263,11 +263,28 @@ class OdooBenchGUI:
             elif widget_class == "Menu":
                 widget.configure(bg=menu_bg, fg=fg,
                                activebackground=select_bg, activeforeground=fg)
+            elif widget_class == "Toplevel":
+                widget.configure(bg=menu_bg)
         except tk.TclError:
             pass
 
         for child in widget.winfo_children():
             self._configure_widgets_recursive(child, bg, fg, select_bg, menu_bg)
+
+    def _apply_theme_to_dialog(self, dialog):
+        """Apply current theme to a dialog window."""
+        is_dark = self.dark_mode_var.get()
+
+        if is_dark:
+            bg = "#2b2b2b"
+            fg = "#a9b7c6"
+            text_bg = "#313335"
+            select_bg = "#214283"
+            dialog.configure(bg=bg)
+            self._configure_widgets_recursive(dialog, text_bg, fg, select_bg, bg)
+        # Light mode: let system defaults handle it, just apply to Text/Listbox widgets
+        else:
+            pass  # ttk widgets handle light mode automatically
 
     def _check_for_updates(self):
         """Check for updates in background."""
@@ -418,8 +435,8 @@ class OdooBenchGUI:
             success, errors, messages = self.conn_manager.import_connections(json_data)
 
             # Refresh the connection lists
-            self.refresh_odoo_list()
-            self.refresh_ssh_list()
+            self.load_connections_list()
+            self.refresh_connections()
 
             # Show result
             result_msg = f"Import complete!\n\nSuccessful: {success}\nFailed: {errors}"
@@ -440,7 +457,7 @@ class OdooBenchGUI:
 
     def setup_dialog_bindings(self, dialog, cancel_command=None, accept_command=None, first_field=None):
         """Setup standard keyboard bindings for dialogs
-        
+
         Args:
             dialog: The Toplevel dialog window
             cancel_command: Function to call on Escape (defaults to dialog.destroy)
@@ -451,11 +468,11 @@ class OdooBenchGUI:
         if cancel_command is None:
             cancel_command = dialog.destroy
         dialog.bind('<Escape>', lambda e: cancel_command())
-        
+
         # Set up Enter key for default action
         if accept_command:
             dialog.bind('<Return>', lambda e: accept_command())
-        
+
         # Focus on first field if provided
         if first_field:
             def set_focus_and_select():
@@ -466,7 +483,7 @@ class OdooBenchGUI:
                 elif hasattr(first_field, 'selection_range'):
                     first_field.selection_range(0, 'end')
             dialog.after(100, set_focus_and_select)
-        
+
         # Make dialog modal
         dialog.transient(self.root)
         dialog.grab_set()
@@ -2005,11 +2022,11 @@ https://github.com/jpsteil/odoo-backup-manager
         if not selection:
             messagebox.showwarning("Warning", "Please select an Odoo connection to edit")
             return
-        
+
         # Get connection ID from tree item
         item = self.odoo_tree.item(selection[0])
         conn_id = int(item["tags"][0]) if item["tags"] else None
-        
+
         if not conn_id:
             messagebox.showerror("Error", "Could not get connection ID")
             return
@@ -2065,8 +2082,8 @@ https://github.com/jpsteil/odoo-backup-manager
             entry = ttk.Entry(details_frame, width=width)
             if field_name == "password":
                 entry.config(show="*")
-            # Get value from conn dict, with default
-            value = conn.get(default_key, "")
+            # Get value from conn dict, with default (handle None values)
+            value = conn.get(default_key) or ""
             if field_name == "port":
                 value = str(value) if value else "5432"
             entry.insert(0, value)
@@ -2079,7 +2096,7 @@ https://github.com/jpsteil/odoo-backup-manager
         path_frame = ttk.Frame(details_frame)
         path_frame.grid(row=row, column=1, sticky="ew", pady=5)
         fields["filestore_path"] = ttk.Entry(path_frame, width=22)
-        fields["filestore_path"].insert(0, conn.get("filestore_path", ""))
+        fields["filestore_path"].insert(0, conn.get("filestore_path") or "")
         fields["filestore_path"].pack(side=tk.LEFT, fill=tk.X, expand=True)
         fields["browse_button"] = ttk.Button(
             path_frame,
@@ -2246,13 +2263,14 @@ https://github.com/jpsteil/odoo-backup-manager
         x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (width // 2)
         y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (height // 2)
         dialog.geometry(f"{width}x{height}+{x}+{y}")
-        
+        dialog.update()
+
         # Setup keyboard bindings and focus
         self.setup_dialog_bindings(dialog,
                                  cancel_command=dialog.destroy,
                                  accept_command=save_connection,
                                  first_field=fields.get("name"))
-    
+
     def edit_ssh_connection(self):
         """Edit selected SSH connection"""
         selection = self.ssh_tree.selection()
@@ -2387,27 +2405,37 @@ https://github.com/jpsteil/odoo-backup-manager
         if not selection:
             messagebox.showwarning("Warning", "Please select an Odoo connection to delete")
             return
-        
+
         item = self.odoo_tree.item(selection[0])
         conn_name = item["text"]
-        
+        conn_id = int(item["tags"][0]) if item["tags"] else None
+
+        if not conn_id:
+            messagebox.showerror("Error", "Could not get connection ID")
+            return
+
         if messagebox.askyesno("Confirm", f"Delete Odoo connection '{conn_name}'?"):
-            if self.conn_manager.delete_connection(conn_name):
+            if self.conn_manager.delete_odoo_connection(conn_id):
                 self.load_connections_list()
                 self.refresh_connections()
-    
+
     def delete_ssh_connection(self):
         """Delete selected SSH connection"""
         selection = self.ssh_tree.selection()
         if not selection:
             messagebox.showwarning("Warning", "Please select an SSH connection to delete")
             return
-        
+
         item = self.ssh_tree.item(selection[0])
         conn_name = item["text"]
-        
+        conn_id = int(item["tags"][0]) if item["tags"] else None
+
+        if not conn_id:
+            messagebox.showerror("Error", "Could not get connection ID")
+            return
+
         if messagebox.askyesno("Confirm", f"Delete SSH connection '{conn_name}'?"):
-            if self.conn_manager.delete_connection(conn_name):
+            if self.conn_manager.delete_ssh_connection(conn_id):
                 self.load_connections_list()
     
     def test_selected_connection(self, conn_type):

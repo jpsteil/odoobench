@@ -17,21 +17,8 @@ class ConnectionManager:
 
     def __init__(self, db_path=None):
         if db_path is None:
-            # Store database in user's home directory
-            home_dir = Path.home()
-            # Try new location first
-            new_config_dir = home_dir / ".config" / "odoobench"
-            old_config_dir = home_dir / ".config" / "odoo-backup-manager"
-
-            # Use new location, but check for old database
-            new_config_dir.mkdir(parents=True, exist_ok=True)
-            db_path = new_config_dir / "connections.db"
-
-            # If database doesn't exist in new location but exists in old, copy it
-            if not db_path.exists() and (old_config_dir / "connections.db").exists():
-                import shutil
-                shutil.copy2(old_config_dir / "connections.db", db_path)
-                print(f"Migrated database from old location to {db_path}")
+            # Store database inside the package directory
+            db_path = Path(__file__).parent / "connections.db"
         self.db_path = str(db_path)
         self.cipher_suite = self._get_cipher()
         self._init_db()
