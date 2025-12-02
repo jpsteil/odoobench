@@ -9,9 +9,9 @@ from pathlib import Path
 this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text() if (this_directory / "README.md").exists() else ""
 
-# Read version from __init__.py
+# Read version from version.py
 def get_version():
-    version_file = this_directory / "odoobench" / "__init__.py"
+    version_file = this_directory / "odoobench" / "version.py"
     version_content = version_file.read_text()
     # Look for __version__ = "x.y.z" or __version__ = 'x.y.z'
     for line in version_content.splitlines():
