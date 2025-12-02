@@ -592,3 +592,121 @@ class ConnectionManager:
         )
         conn.commit()
         conn.close()
+
+    def export_connections(self):
+        """Export all connections as JSON (without passwords)."""
+        import json
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        export_data = {
+            "version": "1.0",
+            "ssh_connections": [],
+            "odoo_connections": [],
+        }
+
+        # Export SSH connections (without passwords)
+        cursor.execute(
+            """
+            SELECT name, host, port, username, key_path
+            FROM ssh_connections
+            ORDER BY name
+            """
+        )
+        for row in cursor.fetchall():
+            export_data["ssh_connections"].append({
+                "name": row[0],
+                "host": row[1],
+                "port": row[2],
+                "username": row[3],
+                "key_path": row[4] or "",
+            })
+
+        # Export Odoo connections (without passwords)
+        cursor.execute(
+            """
+            SELECT o.name, o.host, o.port, o.database, o.username,
+                   o.filestore_path, o.odoo_version, o.is_local, o.allow_restore,
+                   s.name as ssh_name
+            FROM odoo_connections o
+            LEFT JOIN ssh_connections s ON o.ssh_connection_id = s.id
+            ORDER BY o.name
+            """
+        )
+        for row in cursor.fetchall():
+            export_data["odoo_connections"].append({
+                "name": row[0],
+                "host": row[1],
+                "port": row[2],
+                "database": row[3] or "",
+                "username": row[4],
+                "filestore_path": row[5] or "",
+                "odoo_version": row[6] or "17.0",
+                "is_local": bool(row[7]),
+                "allow_restore": bool(row[8]),
+                "ssh_connection_name": row[9] or "",
+            })
+
+        conn.close()
+        return json.dumps(export_data, indent=2)
+
+    def import_connections(self, json_data):
+        """Import connections from JSON. Returns (success_count, error_count, messages)."""
+        import json
+
+        try:
+            data = json.loads(json_data)
+        except json.JSONDecodeError as e:
+            return 0, 1, [f"Invalid JSON: {e}"]
+
+        success_count = 0
+        error_count = 0
+        messages = []
+
+        # Import SSH connections first (so they can be referenced by Odoo connections)
+        for ssh in data.get("ssh_connections", []):
+            try:
+                config = {
+                    "host": ssh.get("host", "localhost"),
+                    "port": ssh.get("port", 22),
+                    "username": ssh.get("username", ""),
+                    "password": None,  # Passwords not imported
+                    "ssh_key_path": ssh.get("key_path", ""),
+                }
+                if self.save_ssh_connection(ssh["name"], config):
+                    success_count += 1
+                    messages.append(f"Imported SSH: {ssh['name']}")
+                else:
+                    error_count += 1
+                    messages.append(f"Failed to import SSH: {ssh['name']}")
+            except Exception as e:
+                error_count += 1
+                messages.append(f"Error importing SSH {ssh.get('name', 'unknown')}: {e}")
+
+        # Import Odoo connections
+        for odoo in data.get("odoo_connections", []):
+            try:
+                config = {
+                    "host": odoo.get("host", "localhost"),
+                    "port": odoo.get("port", 5432),
+                    "database": odoo.get("database", ""),
+                    "username": odoo.get("username", "odoo"),
+                    "password": None,  # Passwords not imported
+                    "filestore_path": odoo.get("filestore_path", ""),
+                    "odoo_version": odoo.get("odoo_version", "17.0"),
+                    "is_local": odoo.get("is_local", False),
+                    "allow_restore": odoo.get("allow_restore", False),
+                    "ssh_connection_name": odoo.get("ssh_connection_name", ""),
+                }
+                if self.save_odoo_connection(odoo["name"], config):
+                    success_count += 1
+                    messages.append(f"Imported Odoo: {odoo['name']}")
+                else:
+                    error_count += 1
+                    messages.append(f"Failed to import Odoo: {odoo['name']}")
+            except Exception as e:
+                error_count += 1
+                messages.append(f"Error importing Odoo {odoo.get('name', 'unknown')}: {e}")
+
+        return success_count, error_count, messages

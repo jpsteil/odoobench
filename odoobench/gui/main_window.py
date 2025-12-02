@@ -376,6 +376,68 @@ class OdooBenchGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to remove launcher:\n{e}")
 
+    def _export_connections(self):
+        """Export all connections to a JSON file (without passwords)."""
+        try:
+            json_data = self.conn_manager.export_connections()
+
+            # Ask user where to save
+            file_path = filedialog.asksaveasfilename(
+                title="Export Connections",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+                initialfile="odoobench_connections.json"
+            )
+
+            if file_path:
+                with open(file_path, "w") as f:
+                    f.write(json_data)
+                messagebox.showinfo(
+                    "Export Successful",
+                    f"Connections exported to:\n{file_path}\n\n"
+                    "Note: Passwords are NOT included for security.\n"
+                    "You'll need to set passwords after importing."
+                )
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export connections:\n{e}")
+
+    def _import_connections(self):
+        """Import connections from a JSON file."""
+        file_path = filedialog.askopenfilename(
+            title="Import Connections",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "r") as f:
+                json_data = f.read()
+
+            success, errors, messages = self.conn_manager.import_connections(json_data)
+
+            # Refresh the connection lists
+            self.refresh_odoo_list()
+            self.refresh_ssh_list()
+
+            # Show result
+            result_msg = f"Import complete!\n\nSuccessful: {success}\nFailed: {errors}"
+            if messages:
+                result_msg += "\n\nDetails:\n" + "\n".join(messages[:10])
+                if len(messages) > 10:
+                    result_msg += f"\n... and {len(messages) - 10} more"
+
+            if errors > 0:
+                result_msg += "\n\nNote: Some connections may already exist."
+
+            result_msg += "\n\nRemember to set passwords for imported connections."
+
+            messagebox.showinfo("Import Complete", result_msg)
+
+        except Exception as e:
+            messagebox.showerror("Import Error", f"Failed to import connections:\n{e}")
+
     def setup_dialog_bindings(self, dialog, cancel_command=None, accept_command=None, first_field=None):
         """Setup standard keyboard bindings for dialogs
         
@@ -667,6 +729,22 @@ class OdooBenchGUI:
             launcher_frame,
             text="Remove Launcher",
             command=self._remove_launcher
+        ).pack(side="left")
+
+        # Export/Import connections
+        export_import_frame = ttk.Frame(settings_frame)
+        export_import_frame.pack(fill="x", pady=5)
+
+        ttk.Label(export_import_frame, text="Connections:").pack(side="left", padx=(0, 10))
+        ttk.Button(
+            export_import_frame,
+            text="Export",
+            command=self._export_connections
+        ).pack(side="left", padx=(0, 5))
+        ttk.Button(
+            export_import_frame,
+            text="Import",
+            command=self._import_connections
         ).pack(side="left")
 
         # Create PanedWindow for two sections
