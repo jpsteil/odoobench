@@ -13,12 +13,8 @@ import getpass
 
 def detect_gui_capability():
     """Detect if GUI can be launched"""
-    # Check if we're in a pipe or being redirected
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        return False
-
-    # Check for display
-    if not os.environ.get('DISPLAY') and not sys.platform.startswith('win') and not sys.platform == 'darwin':
+    # Check for display (Linux/Unix)
+    if not os.environ.get('DISPLAY') and not os.environ.get('WAYLAND_DISPLAY') and not sys.platform.startswith('win') and not sys.platform == 'darwin':
         return False
 
     # Check if tkinter is available
