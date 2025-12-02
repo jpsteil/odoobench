@@ -62,4 +62,4 @@ include-package-data = false
 version = {attr = "odoobench.version.__version__"}
 
 [tool.setuptools.package-data]
-odoobench = ["py.typed"]
+odoobench = ["py.typed", "resources/*.png"]
