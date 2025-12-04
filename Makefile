@@ -2,8 +2,8 @@
 
 .PHONY: all help install build test check clean distclean run run-cli run-gui lint format deps dev
 
-# Detect Python command - use python if available, otherwise python3
-PYTHON := $(shell command -v python 2>/dev/null || command -v python3 2>/dev/null)
+# Detect Python command - prefer python3
+PYTHON := $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
 
 # Default target - typically builds/compiles the project
 all: install

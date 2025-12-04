@@ -121,6 +121,42 @@ class OdooBench:
             self.log(error_msg, "error")
             raise Exception(error_msg)
 
+    def _normalize_filestore_path(self, base_path, db_name):
+        """Normalize and construct proper filestore path.
+
+        Returns the full path to the database filestore, handling various input formats:
+        - If base_path already contains /filestore/db_name, return as-is
+        - If base_path ends with /filestore, append db_name
+        - Otherwise append /filestore/db_name
+        """
+        if not base_path or not db_name:
+            return base_path
+
+        # Normalize path separators and remove trailing slashes
+        normalized_path = os.path.normpath(base_path)
+        path_parts = normalized_path.replace('\\', '/').split('/')
+
+        # Check if the path already contains the complete filestore/db_name structure
+        for i in range(len(path_parts) - 1):
+            if path_parts[i] == 'filestore' and path_parts[i + 1] == db_name:
+                # Path already contains filestore/db_name, return as-is
+                return normalized_path
+
+        # Check if path ends with just 'filestore'
+        if path_parts[-1] == 'filestore':
+            # Just append database name
+            return os.path.join(normalized_path, db_name)
+
+        # Check if path ends with the database name (might already be complete)
+        if path_parts[-1] == db_name:
+            # Check if filestore is the second-to-last element
+            if len(path_parts) > 1 and path_parts[-2] == 'filestore':
+                # Path already complete (ends with filestore/db_name)
+                return normalized_path
+
+        # Default case: append filestore/db_name
+        return os.path.join(normalized_path, 'filestore', db_name)
+
     def test_connection(self, config):
         """Test database connection and filestore path"""
         messages = []
@@ -213,23 +249,25 @@ class OdooBench:
                     messages.append(f"⚠ Could not test remote filestore: {str(e)}")
             else:
                 # Test local filestore path
-                if os.path.exists(filestore_path):
-                    messages.append(f"✓ Local filestore path exists: {filestore_path}")
-                else:
-                    # Try with database name appended
-                    db_name = config.get("db_name", "")
-                    if db_name:
-                        full_path = os.path.join(filestore_path, "filestore", db_name)
-                        if os.path.exists(full_path):
-                            messages.append(
-                                f"✓ Local filestore path exists: {full_path}"
-                            )
-                        else:
-                            messages.append(f"⚠ Local filestore path not found")
+                db_name = config.get("db_name", "")
+                if db_name:
+                    # Use the normalize function to get the expected full path
+                    full_path = self._normalize_filestore_path(filestore_path, db_name)
+                    if os.path.exists(full_path):
+                        messages.append(f"✓ Local filestore path exists: {full_path}")
                     else:
-                        messages.append(
-                            f"⚠ Local filestore path not found: {filestore_path}"
-                        )
+                        # Also check if the base path exists without appending
+                        if os.path.exists(filestore_path):
+                            messages.append(f"✓ Local filestore base path exists: {filestore_path}")
+                            messages.append(f"  Note: Expected full path would be: {full_path}")
+                        else:
+                            messages.append(f"⚠ Local filestore path not found: {full_path}")
+                else:
+                    # No database name provided, just check the base path
+                    if os.path.exists(filestore_path):
+                        messages.append(f"✓ Local filestore path exists: {filestore_path}")
+                    else:
+                        messages.append(f"⚠ Local filestore path not found: {filestore_path}")
 
         # Return combined result
         return not has_errors, "\n".join(messages)
@@ -304,7 +342,14 @@ class OdooBench:
         self.log(f"Backing up database: {config['db_name']}...")
         self.update_progress(20, "Backing up database...")
 
-        # Build pg_dump command
+        # Check if this is a remote connection - if so, run pg_dump on the server
+        if config.get("use_ssh") and config.get("ssh_connection_id"):
+            return self._backup_remote_database(config)
+        else:
+            return self._backup_local_database(config)
+
+    def _backup_local_database(self, config):
+        """Backup database using local pg_dump"""
         dump_file = os.path.join(self.temp_dir, f"{config['db_name']}.sql")
 
         env = os.environ.copy()
@@ -332,6 +377,91 @@ class OdooBench:
         self.log(f"Database backed up successfully")
         self.update_progress(40, "Database backup complete")
         return dump_file
+
+    def _backup_remote_database(self, config):
+        """Backup database by running pg_dump on the remote server via SSH
+
+        This is much faster than running pg_dump locally against a remote database:
+        - pg_dump runs locally on the server (fast localhost connection)
+        - Output is compressed on the server (faster transfer)
+        - Single compressed file transfer instead of streaming raw data
+        """
+        ssh_conn = self.conn_manager.get_ssh_connection(config["ssh_connection_id"])
+        if not ssh_conn:
+            self.log("Error: SSH connection not found, falling back to local pg_dump", "warning")
+            return self._backup_local_database(config)
+
+        self.log("Running pg_dump on remote server...")
+
+        try:
+            ssh = self._get_ssh_client(ssh_conn)
+
+            # Remote temp file for the dump (compressed for faster transfer)
+            remote_dump = f"/tmp/pgdump_{config['db_name']}_{self.timestamp}.sql.gz"
+            local_dump_gz = os.path.join(self.temp_dir, f"{config['db_name']}.sql.gz")
+            local_dump = os.path.join(self.temp_dir, f"{config['db_name']}.sql")
+
+            # Build pg_dump command to run on the remote server with gzip compression
+            db_host = config.get("db_host", "localhost")
+            db_port = config.get("db_port", 5432)
+            db_user = config.get("db_user", "odoo")
+            db_name = config["db_name"]
+            db_password = config.get("db_password", "")
+
+            # Set PGPASSWORD and run pg_dump with gzip compression
+            if db_password:
+                pg_dump_cmd = f"PGPASSWORD='{db_password}' pg_dump -h {db_host} -p {db_port} -U {db_user} -d {db_name} --no-owner --no-acl | gzip > {remote_dump}"
+            else:
+                pg_dump_cmd = f"pg_dump -h {db_host} -p {db_port} -U {db_user} -d {db_name} --no-owner --no-acl | gzip > {remote_dump}"
+
+            self.log(f"Executing pg_dump on remote server (with compression)...")
+            stdin, stdout, stderr = ssh.exec_command(pg_dump_cmd)
+            exit_status = stdout.channel.recv_exit_status()
+
+            if exit_status != 0:
+                error_msg = stderr.read().decode()
+                self.log(f"Remote pg_dump failed: {error_msg}", "error")
+                ssh.close()
+                raise Exception(f"Remote pg_dump failed: {error_msg}")
+
+            self.log("pg_dump completed, downloading compressed dump file...")
+            self.update_progress(30, "Downloading database dump...")
+
+            # Download the compressed dump file via SFTP
+            sftp = ssh.open_sftp()
+            try:
+                # Get file size for progress info
+                stat = sftp.stat(remote_dump)
+                file_size_mb = stat.st_size / (1024 * 1024)
+                self.log(f"Compressed dump file size: {file_size_mb:.1f} MB")
+
+                sftp.get(remote_dump, local_dump_gz)
+                self.log("Download complete")
+            finally:
+                sftp.close()
+
+            # Clean up remote temp file
+            self.log("Cleaning up remote temporary file...")
+            ssh.exec_command(f"rm -f {remote_dump}")
+            ssh.close()
+
+            # Decompress locally
+            self.log("Decompressing dump file...")
+            import gzip
+            with gzip.open(local_dump_gz, 'rb') as f_in:
+                with open(local_dump, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+
+            # Remove compressed file
+            os.remove(local_dump_gz)
+
+            self.log(f"Database backed up successfully")
+            self.update_progress(40, "Database backup complete")
+            return local_dump
+
+        except Exception as e:
+            self.log(f"Error during remote database backup: {str(e)}", "error")
+            raise
 
     def backup_filestore(self, config):
         """Backup Odoo filestore"""
@@ -451,20 +581,27 @@ class OdooBench:
 
     def _backup_local_filestore(self, config, filestore_path):
         """Backup local filestore"""
-        if not os.path.exists(filestore_path):
+        # Build the complete filestore path with database name
+        db_name = config.get("db_name", "")
+        if db_name:
+            full_filestore_path = self._normalize_filestore_path(filestore_path, db_name)
+        else:
+            full_filestore_path = filestore_path
+
+        if not os.path.exists(full_filestore_path):
             self.log(
-                f"Warning: Local filestore path does not exist: {filestore_path}",
+                f"Warning: Local filestore path does not exist: {full_filestore_path}",
                 "warning",
             )
             return None
 
-        self.log(f"Backing up local filestore: {filestore_path}...")
+        self.log(f"Backing up local filestore: {full_filestore_path}...")
         self.update_progress(50, "Backing up filestore...")
 
         # Create tar archive of filestore
         archive_name = os.path.join(self.temp_dir, "filestore.tar.gz")
         with tarfile.open(archive_name, "w:gz") as tar:
-            tar.add(filestore_path, arcname="filestore")
+            tar.add(full_filestore_path, arcname="filestore")
 
         self.log(f"Filestore backed up successfully")
         self.update_progress(70, "Filestore backup complete")
@@ -579,15 +716,22 @@ class OdooBench:
             ]
 
             result = subprocess.run(check_cmd, env=env, capture_output=True, text=True)
-            db_exists = config["db_name"] in result.stdout
+            # Parse psql -lqt output more carefully - each line has: name | owner | encoding | ...
+            # We need exact match on the database name (first column, stripped)
+            db_exists = False
+            for line in result.stdout.split('\n'):
+                parts = line.split('|')
+                if parts and parts[0].strip() == config["db_name"]:
+                    db_exists = True
+                    break
 
             if db_exists:
                 # Drop existing database
                 self.log(f"Dropping existing database: {config['db_name']}...")
                 # Terminate connections
                 terminate_cmd = f"""
-                    SELECT pg_terminate_backend(pid) 
-                    FROM pg_stat_activity 
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
                     WHERE datname = '{config['db_name']}' AND pid <> pg_backend_pid();
                 """
                 subprocess.run(
@@ -608,9 +752,10 @@ class OdooBench:
                     capture_output=True,
                 )
 
-                # Drop database
+                # Drop database with --if-exists to avoid errors if it disappeared
                 drop_cmd = [
                     "dropdb",
+                    "--if-exists",
                     "-h",
                     config["db_host"],
                     "-p",
@@ -619,8 +764,11 @@ class OdooBench:
                     config["db_user"],
                     config["db_name"],
                 ]
-                subprocess.run(drop_cmd, env=env, check=True, 
-                             capture_output=True, text=True)
+                result = subprocess.run(drop_cmd, env=env, capture_output=True, text=True)
+                if result.returncode != 0:
+                    error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                    self.log(f"dropdb stderr: {error_msg}", "error")
+                    raise subprocess.CalledProcessError(result.returncode, drop_cmd, result.stdout, result.stderr)
 
             # Create database
             self.log(f"Creating database: {config['db_name']}...")
@@ -634,8 +782,11 @@ class OdooBench:
                 config["db_user"],
                 config["db_name"],
             ]
-            subprocess.run(create_cmd, env=env, check=True, 
-                         capture_output=True, text=True)
+            result = subprocess.run(create_cmd, env=env, capture_output=True, text=True)
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                self.log(f"createdb stderr: {error_msg}", "error")
+                raise subprocess.CalledProcessError(result.returncode, create_cmd, result.stdout, result.stderr)
 
             # Restore database
             self.update_progress(50, "Importing database data...")
@@ -655,8 +806,11 @@ class OdooBench:
                 "-q",  # Quiet mode since we're capturing output anyway
             ]
             # Capture output to prevent flooding console
-            subprocess.run(restore_cmd, env=env, check=True, 
-                         capture_output=True, text=True)
+            result = subprocess.run(restore_cmd, env=env, capture_output=True, text=True)
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                self.log(f"psql restore stderr: {error_msg}", "error")
+                raise subprocess.CalledProcessError(result.returncode, restore_cmd, result.stdout, result.stderr)
 
             self.log(f"Database restored successfully")
             self.update_progress(70, "Database restore complete")
@@ -685,19 +839,13 @@ class OdooBench:
     
     def _restore_local_filestore(self, config, filestore_path, filestore_archive):
         """Restore filestore locally"""
-        # Build full filestore path with database name if needed
+        # Build full filestore path with database name using the normalize function
         db_name = config.get("db_name", "")
-        if db_name and not filestore_path.endswith(db_name):
-            # Check if path already ends with 'filestore'
-            if filestore_path.rstrip('/').endswith('filestore'):
-                # Path already has filestore, just add database name
-                target_base_path = os.path.join(filestore_path, db_name)
-            else:
-                # Path doesn't have filestore, add filestore/db_name
-                target_base_path = os.path.join(filestore_path, "filestore", db_name)
+        if db_name:
+            target_base_path = self._normalize_filestore_path(filestore_path, db_name)
         else:
             target_base_path = filestore_path
-            
+
         self.log(f"Restoring filestore locally to: {target_base_path}...")
         self.update_progress(75, "Restoring filestore...")
 
@@ -1236,6 +1384,7 @@ class OdooBench:
 
     def backup_and_restore(self, source_config, dest_config):
         """Perform backup from source and restore to destination in one operation"""
+        backup_file = None
         try:
             self.log("=== Starting Backup and Restore Operation ===", "info")
 
@@ -1248,8 +1397,11 @@ class OdooBench:
             self.restore(dest_config, backup_file)
 
             self.log("=== Backup and Restore Complete ===", "success")
-            return True
+            return backup_file  # Return the backup file path for reference
 
         except Exception as e:
             self.log(f"Backup and restore failed: {str(e)}", "error")
+            if backup_file:
+                self.log(f"Backup file preserved at: {backup_file}", "warning")
+                self.log("You can manually restore from this backup file.", "info")
             raise
