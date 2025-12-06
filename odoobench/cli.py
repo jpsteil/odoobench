@@ -232,12 +232,12 @@ def launch_gui():
     """Launch the GUI interface"""
     try:
         import tkinter as tk
-        from .gui.main_window import OdooBenchGUI
+        from .gui.instance_window import InstanceWindow
 
         # Set className for proper window manager integration (Linux/X11)
         # This makes the app icon show correctly in GNOME overview
         root = tk.Tk(className="odoobench")
-        app = OdooBenchGUI(root)
+        app = InstanceWindow(root)
         root.mainloop()
     except ImportError as e:
         print("Error: GUI dependencies not available.")
