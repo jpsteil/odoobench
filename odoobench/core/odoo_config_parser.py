@@ -210,11 +210,11 @@ class OdooConfigParser:
         Returns:
             List of database names
         """
-        # Build psql command to list databases
+        psql, use_local = self._find_psql()
         env_prefix = f"PGPASSWORD='{db_password}' " if db_password else ""
-        cmd = f"{env_prefix}psql -h {db_host} -p {db_port} -U {db_user} -d postgres -t -c \"SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres') ORDER BY datname;\""
+        cmd = f"{env_prefix}{psql} -h {db_host} -p {db_port} -U {db_user} -d postgres -t -c \"SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres') ORDER BY datname;\""
 
-        stdout, stderr, code = self.executor.run_command(cmd)
+        stdout, stderr, code = self._run_psql_command(cmd, use_local)
 
         if code != 0:
             return []
@@ -231,13 +231,14 @@ class OdooConfigParser:
         Returns:
             Tuple of (success: bool, message: str)
         """
+        psql, use_local = self._find_psql()
         env_prefix = f"PGPASSWORD='{db_password}' " if db_password else ""
-        cmd = f"{env_prefix}psql -h {db_host} -p {db_port} -U {db_user} -d postgres -c \"SELECT version();\" 2>&1"
+        cmd = f"{env_prefix}{psql} -h {db_host} -p {db_port} -U {db_user} -d postgres -c \"SELECT version();\" 2>&1"
 
-        stdout, stderr, code = self.executor.run_command(cmd, timeout=10)
+        stdout, stderr, code = self._run_psql_command(cmd, use_local)
 
         if code == 0:
-            return True, "Database connection successful"
+            return True, f"Database connection successful{' (using local psql)' if use_local else ''}"
         else:
             error = stderr or stdout
             return False, f"Connection failed: {error}"
@@ -289,3 +290,253 @@ class OdooConfigParser:
             }
 
         return {}
+
+    def _find_psql(self) -> tuple:
+        """
+        Find the psql command, checking common paths.
+
+        Returns:
+            Tuple of (psql_path, use_local) where use_local indicates
+            whether to run psql locally instead of via the executor.
+        """
+        # Try common PostgreSQL paths first (most reliable)
+        common_paths = [
+            '/usr/bin/psql',
+            '/usr/local/bin/psql',
+            '/usr/pgsql-17/bin/psql',
+            '/usr/pgsql-16/bin/psql',
+            '/usr/pgsql-15/bin/psql',
+            '/usr/pgsql-14/bin/psql',
+            '/usr/lib/postgresql/17/bin/psql',
+            '/usr/lib/postgresql/16/bin/psql',
+            '/usr/lib/postgresql/15/bin/psql',
+            '/usr/lib/postgresql/14/bin/psql',
+            '/opt/postgresql/bin/psql',
+        ]
+
+        for path in common_paths:
+            stdout, stderr, code = self.executor.run_command(f"[ -x {path} ] && echo yes")
+            if code == 0 and 'yes' in stdout:
+                return (path, False)
+
+        # Try 'which psql'
+        stdout, stderr, code = self.executor.run_command("which psql 2>/dev/null")
+        if code == 0 and stdout.strip() and '/' in stdout:
+            return (stdout.strip(), False)
+
+        # Try command -v (more portable than which)
+        stdout, stderr, code = self.executor.run_command("command -v psql 2>/dev/null")
+        if code == 0 and stdout.strip() and '/' in stdout:
+            return (stdout.strip(), False)
+
+        # psql not found on remote - try locally instead
+        import subprocess
+        try:
+            result = subprocess.run(['which', 'psql'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0 and result.stdout.strip():
+                return (result.stdout.strip(), True)  # Use local psql
+        except Exception:
+            pass
+
+        # Fall back to just 'psql' on remote and hope it's in PATH
+        return ('psql', False)
+
+    def _run_psql_command(self, cmd: str, use_local: bool = False) -> tuple:
+        """Run a psql command either locally or via executor."""
+        if use_local:
+            import subprocess
+            try:
+                result = subprocess.run(
+                    cmd, shell=True, capture_output=True, text=True, timeout=30
+                )
+                return (result.stdout, result.stderr, result.returncode)
+            except subprocess.TimeoutExpired:
+                return ("", "Command timed out", -1)
+            except Exception as e:
+                return ("", str(e), -1)
+        else:
+            return self.executor.run_command(cmd)
+
+    def get_postgresql_settings(self, db_host: str = 'localhost', db_port: int = 5432,
+                                 db_user: str = 'odoo', db_password: str = '',
+                                 db_name: str = 'postgres') -> Dict[str, Any]:
+        """
+        Get PostgreSQL configuration settings relevant for Odoo performance
+
+        Returns:
+            Dictionary with setting names, values, and units
+        """
+        psql, use_local = self._find_psql()
+
+        settings_query = """
+        SELECT name, setting, unit, boot_val, context
+        FROM pg_settings
+        WHERE name IN (
+            'shared_buffers', 'effective_cache_size', 'work_mem',
+            'maintenance_work_mem', 'max_connections', 'random_page_cost',
+            'effective_io_concurrency', 'checkpoint_completion_target',
+            'wal_buffers', 'max_parallel_workers_per_gather',
+            'max_worker_processes', 'max_parallel_workers'
+        )
+        ORDER BY name;
+        """
+
+        env_prefix = f"PGPASSWORD='{db_password}' " if db_password else ""
+        cmd = f"{env_prefix}{psql} -h {db_host} -p {db_port} -U {db_user} -d {db_name} -t -A -F '|' -c \"{settings_query}\""
+
+        stdout, stderr, code = self._run_psql_command(cmd, use_local)
+
+        if code != 0:
+            error_msg = stderr or stdout
+            if 'command not found' in error_msg or 'not found' in error_msg:
+                return {'error': "psql not found. Install postgresql-client on either:\n"
+                                 "  - The Odoo server (SSH target), or\n"
+                                 "  - Your local machine running OdooBench"}
+            return {'error': error_msg}
+
+        settings = {}
+        for line in stdout.strip().split('\n'):
+            if '|' in line:
+                parts = line.split('|')
+                if len(parts) >= 3:
+                    name = parts[0]
+                    value = parts[1]
+                    unit = parts[2] if parts[2] else ''
+                    settings[name] = {
+                        'value': value,
+                        'unit': unit,
+                        'boot_val': parts[3] if len(parts) > 3 else '',
+                        'context': parts[4] if len(parts) > 4 else '',
+                    }
+
+        return settings
+
+    def get_server_memory(self, db_host: str = 'localhost', db_port: int = 5432,
+                          db_user: str = 'odoo', db_password: str = '',
+                          db_name: str = 'postgres') -> Optional[int]:
+        """
+        Get total server memory in bytes (for calculating recommendations)
+
+        Returns:
+            Total memory in bytes, or None if unable to determine
+        """
+        # Try to get from PostgreSQL (works on Linux)
+        query = "SELECT pg_size_pretty(setting::bigint * 1024) FROM pg_settings WHERE name = 'shared_buffers';"
+
+        # First try to read /proc/meminfo via psql shell command
+        env_prefix = f"PGPASSWORD='{db_password}' " if db_password else ""
+        cmd = f"{env_prefix}psql -h {db_host} -p {db_port} -U {db_user} -d {db_name} -t -c \"COPY (SELECT 1) TO PROGRAM 'cat /proc/meminfo | grep MemTotal'\" 2>/dev/null || echo ''"
+
+        # Simpler approach - just run on the host
+        stdout, stderr, code = self.executor.run_command("grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}'")
+
+        if code == 0 and stdout.strip():
+            try:
+                return int(stdout.strip()) * 1024  # Convert KB to bytes
+            except ValueError:
+                pass
+
+        return None
+
+    def get_database_stats(self, db_host: str = 'localhost', db_port: int = 5432,
+                           db_user: str = 'odoo', db_password: str = '',
+                           db_name: str = 'postgres') -> Dict[str, Any]:
+        """
+        Get database health statistics
+
+        Returns:
+            Dictionary with database stats including size, connections, cache hit ratio
+        """
+        psql, use_local = self._find_psql()
+        stats_query = """
+        SELECT
+            pg_database_size(current_database()) as db_size,
+            (SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()) as active_connections,
+            (SELECT count(*) FROM pg_stat_activity) as total_connections,
+            (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') as max_connections;
+        """
+
+        env_prefix = f"PGPASSWORD='{db_password}' " if db_password else ""
+        db_to_query = db_name if db_name and db_name != 'postgres' else 'postgres'
+        cmd = f"{env_prefix}{psql} -h {db_host} -p {db_port} -U {db_user} -d {db_to_query} -t -A -F '|' -c \"{stats_query}\""
+
+        stdout, stderr, code = self._run_psql_command(cmd, use_local)
+
+        stats = {}
+        if code == 0 and stdout.strip():
+            parts = stdout.strip().split('|')
+            if len(parts) >= 4:
+                stats['db_size'] = int(parts[0]) if parts[0] else 0
+                stats['active_connections'] = int(parts[1]) if parts[1] else 0
+                stats['total_connections'] = int(parts[2]) if parts[2] else 0
+                stats['max_connections'] = int(parts[3]) if parts[3] else 0
+
+        # Get cache hit ratio
+        cache_query = """
+        SELECT
+            CASE WHEN (blks_hit + blks_read) > 0
+                THEN round(100.0 * blks_hit / (blks_hit + blks_read), 2)
+                ELSE 0
+            END as cache_hit_ratio
+        FROM pg_stat_database
+        WHERE datname = current_database();
+        """
+        cmd = f"{env_prefix}{psql} -h {db_host} -p {db_port} -U {db_user} -d {db_to_query} -t -c \"{cache_query}\""
+        stdout, stderr, code = self._run_psql_command(cmd, use_local)
+        if code == 0 and stdout.strip():
+            try:
+                stats['cache_hit_ratio'] = float(stdout.strip())
+            except ValueError:
+                stats['cache_hit_ratio'] = 0
+
+        # Get table bloat info (simplified - count of tables needing vacuum)
+        bloat_query = """
+        SELECT count(*)
+        FROM pg_stat_user_tables
+        WHERE n_dead_tup > 10000;
+        """
+        cmd = f"{env_prefix}{psql} -h {db_host} -p {db_port} -U {db_user} -d {db_to_query} -t -c \"{bloat_query}\""
+        stdout, stderr, code = self._run_psql_command(cmd, use_local)
+        if code == 0 and stdout.strip():
+            try:
+                stats['tables_needing_vacuum'] = int(stdout.strip())
+            except ValueError:
+                stats['tables_needing_vacuum'] = 0
+
+        # Get last vacuum times for critical tables
+        vacuum_query = """
+        SELECT relname, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze
+        FROM pg_stat_user_tables
+        ORDER BY n_dead_tup DESC
+        LIMIT 5;
+        """
+        cmd = f"{env_prefix}{psql} -h {db_host} -p {db_port} -U {db_user} -d {db_to_query} -t -A -F '|' -c \"{vacuum_query}\""
+        stdout, stderr, code = self._run_psql_command(cmd, use_local)
+        if code == 0 and stdout.strip():
+            tables = []
+            for line in stdout.strip().split('\n'):
+                if '|' in line:
+                    parts = line.split('|')
+                    if len(parts) >= 5:
+                        tables.append({
+                            'name': parts[0],
+                            'last_vacuum': parts[1] or 'Never',
+                            'last_autovacuum': parts[2] or 'Never',
+                            'last_analyze': parts[3] or 'Never',
+                            'last_autoanalyze': parts[4] or 'Never',
+                        })
+            stats['top_tables'] = tables
+
+        return stats
+
+    def get_postgresql_version(self, db_host: str = 'localhost', db_port: int = 5432,
+                                db_user: str = 'odoo', db_password: str = '') -> str:
+        """Get PostgreSQL version string"""
+        psql, use_local = self._find_psql()
+        env_prefix = f"PGPASSWORD='{db_password}' " if db_password else ""
+        cmd = f"{env_prefix}{psql} -h {db_host} -p {db_port} -U {db_user} -d postgres -t -c \"SELECT version();\""
+
+        stdout, stderr, code = self._run_psql_command(cmd, use_local)
+        if code == 0:
+            return stdout.strip()
+        return ""

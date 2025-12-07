@@ -352,6 +352,8 @@ class OdooBench:
         """Backup database using local pg_dump"""
         dump_file = os.path.join(self.temp_dir, f"{config['db_name']}.sql")
 
+        self.log(f"Running pg_dump for database: {config['db_name']}...")
+
         env = os.environ.copy()
         if config.get("db_password"):
             env["PGPASSWORD"] = config["db_password"]
@@ -372,9 +374,22 @@ class OdooBench:
             "--no-acl",
         ]
 
-        # Capture output to prevent flooding console
-        subprocess.run(cmd, env=env, check=True, capture_output=True, text=True)
-        self.log(f"Database backed up successfully")
+        # Capture output
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+            self.log(f"pg_dump failed: {error_msg}", "error")
+            raise Exception(f"pg_dump failed: {error_msg}")
+
+        # Verify dump file was created and has content
+        if not os.path.exists(dump_file):
+            raise Exception(f"pg_dump did not create dump file: {dump_file}")
+
+        dump_size = os.path.getsize(dump_file)
+        if dump_size == 0:
+            raise Exception(f"pg_dump created empty dump file - database may not exist or be empty")
+
+        self.log(f"Database dump created: {dump_size / 1024 / 1024:.1f} MB")
         self.update_progress(40, "Database backup complete")
         return dump_file
 
@@ -455,7 +470,15 @@ class OdooBench:
             # Remove compressed file
             os.remove(local_dump_gz)
 
-            self.log(f"Database backed up successfully")
+            # Verify dump file was created and has content
+            if not os.path.exists(local_dump):
+                raise Exception(f"Dump file was not created: {local_dump}")
+
+            dump_size = os.path.getsize(local_dump)
+            if dump_size == 0:
+                raise Exception(f"Dump file is empty - database may not exist or be empty")
+
+            self.log(f"Database dump created: {dump_size / 1024 / 1024:.1f} MB")
             self.update_progress(40, "Database backup complete")
             return local_dump
 
@@ -617,11 +640,25 @@ class OdooBench:
         self.log(f"Creating backup archive: {backup_name}...")
         self.update_progress(80, "Creating archive...")
 
+        # Validate that we have something to backup
+        if not db_dump and not filestore_archive:
+            raise Exception("No database dump or filestore to archive")
+
+        # Validate db_dump file if provided
+        if db_dump:
+            if not os.path.exists(db_dump):
+                raise Exception(f"Database dump file not found: {db_dump}")
+            dump_size = os.path.getsize(db_dump)
+            if dump_size == 0:
+                raise Exception(f"Database dump file is empty: {db_dump}")
+            self.log(f"Database dump size: {dump_size / 1024 / 1024:.1f} MB")
+
         # Create metadata file
         metadata = {
             "timestamp": self.timestamp,
             "db_name": config["db_name"],
             "odoo_version": config.get("odoo_version", "unknown"),
+            "has_database": db_dump is not None,
             "has_filestore": filestore_archive is not None,
         }
 
@@ -631,12 +668,24 @@ class OdooBench:
 
         # Create combined archive
         with tarfile.open(backup_path, "w:gz") as tar:
-            tar.add(db_dump, arcname="database.sql")
             tar.add(metadata_file, arcname="metadata.json")
+            if db_dump:
+                tar.add(db_dump, arcname="database.sql")
+                self.log("Added database.sql to archive")
             if filestore_archive:
                 tar.add(filestore_archive, arcname="filestore.tar.gz")
+                self.log("Added filestore.tar.gz to archive")
 
-        self.log(f"✅ Backup complete: {backup_path}", "success")
+        # Verify archive was created and has content
+        archive_size = os.path.getsize(backup_path)
+        self.log(f"Archive size: {archive_size / 1024 / 1024:.1f} MB")
+
+        # List archive contents for verification
+        with tarfile.open(backup_path, "r:gz") as tar:
+            contents = tar.getnames()
+            self.log(f"Archive contents: {contents}")
+
+        self.log(f"Backup complete: {backup_path}", "success")
         self.update_progress(90, "Backup archive created")
         return backup_path
 
@@ -681,23 +730,67 @@ class OdooBench:
 
         # Find files
         files = os.listdir(extract_dir)
+        self.log(f"Extracted files: {files}")
         db_dump = None
         filestore_archive = None
 
         for file in files:
+            full_path = os.path.join(extract_dir, file)
             if file.endswith(".sql"):
-                db_dump = os.path.join(extract_dir, file)
+                db_dump = full_path
+                # Log file size to verify it's not empty
+                file_size = os.path.getsize(full_path)
+                self.log(f"Found SQL dump: {file} ({file_size / 1024 / 1024:.1f} MB)")
+            elif file.endswith(".dump"):
+                # PostgreSQL custom format - requires pg_restore
+                db_dump = full_path
+                file_size = os.path.getsize(full_path)
+                self.log(f"Found custom format dump: {file} ({file_size / 1024 / 1024:.1f} MB)")
             elif "filestore" in file and file.endswith(".tar.gz"):
-                filestore_archive = os.path.join(extract_dir, file)
+                filestore_archive = full_path
+                file_size = os.path.getsize(full_path)
+                self.log(f"Found filestore archive: {file} ({file_size / 1024 / 1024:.1f} MB)")
+
+        if not db_dump:
+            self.log(f"Warning: No database dump found in backup. Files: {files}", "warning")
 
         self.update_progress(20, "Backup extracted")
         return db_dump, filestore_archive, metadata
 
     def restore_database(self, config, db_dump):
         """Restore PostgreSQL database"""
+        self.log(f"Restoring database: {config['db_name']}...")
+        self.update_progress(30, "Restoring database...")
+
+        # Check if this is a remote connection - if so, run restore on the server
+        if config.get("use_ssh") and config.get("ssh_connection_id"):
+            return self._restore_remote_database(config, db_dump)
+        else:
+            return self._restore_local_database(config, db_dump)
+
+    def _restore_local_database(self, config, db_dump):
+        """Restore database using local psql or pg_restore"""
         try:
-            self.log(f"Restoring database: {config['db_name']}...")
-            self.update_progress(30, "Restoring database...")
+            # Validate dump file exists and has content
+            if not os.path.exists(db_dump):
+                raise Exception(f"Database dump file not found: {db_dump}")
+
+            dump_size = os.path.getsize(db_dump)
+            if dump_size == 0:
+                raise Exception(f"Database dump file is empty: {db_dump}")
+
+            self.log(f"Dump file: {db_dump} ({dump_size / 1024 / 1024:.1f} MB)")
+
+            # Determine if this is SQL (plain) or custom format
+            is_custom_format = db_dump.endswith('.dump')
+            if not is_custom_format:
+                # Check file header to detect format
+                with open(db_dump, 'rb') as f:
+                    header = f.read(5)
+                    # Custom format starts with PGDMP
+                    if header == b'PGDMP':
+                        is_custom_format = True
+                        self.log("Detected PostgreSQL custom dump format")
 
             env = os.environ.copy()
             if config.get("db_password"):
@@ -788,10 +881,61 @@ class OdooBench:
                 self.log(f"createdb stderr: {error_msg}", "error")
                 raise subprocess.CalledProcessError(result.returncode, create_cmd, result.stdout, result.stderr)
 
-            # Restore database
+            # Restore database - use pg_restore for custom format, psql for plain SQL
             self.update_progress(50, "Importing database data...")
 
-            restore_cmd = [
+            if is_custom_format:
+                self.log("Using pg_restore for custom format dump...")
+                restore_cmd = [
+                    "pg_restore",
+                    "-h",
+                    config["db_host"],
+                    "-p",
+                    str(config["db_port"]),
+                    "-U",
+                    config["db_user"],
+                    "-d",
+                    config["db_name"],
+                    "--no-owner",
+                    "--no-acl",
+                    "-v",  # Verbose to see progress
+                    db_dump,
+                ]
+            else:
+                self.log("Using psql for plain SQL dump...")
+                restore_cmd = [
+                    "psql",
+                    "-h",
+                    config["db_host"],
+                    "-p",
+                    str(config["db_port"]),
+                    "-U",
+                    config["db_user"],
+                    "-d",
+                    config["db_name"],
+                    "-f",
+                    db_dump,
+                    "-v", "ON_ERROR_STOP=1",  # Stop on first error
+                ]
+
+            # Capture output
+            result = subprocess.run(restore_cmd, env=env, capture_output=True, text=True)
+
+            # Log any stderr output for debugging
+            if result.stderr:
+                # Filter out common noise
+                stderr_lines = result.stderr.strip().split('\n')
+                important_lines = [l for l in stderr_lines if l and not l.startswith('SET') and 'NOTICE:' not in l]
+                if important_lines:
+                    self.log(f"Restore output: {' | '.join(important_lines[:5])}", "info")
+
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                self.log(f"Restore failed: {error_msg}", "error")
+                raise subprocess.CalledProcessError(result.returncode, restore_cmd, result.stdout, result.stderr)
+
+            # Verify restore worked by checking table count
+            verify_cmd = [
                 "psql",
                 "-h",
                 config["db_host"],
@@ -801,16 +945,16 @@ class OdooBench:
                 config["db_user"],
                 "-d",
                 config["db_name"],
-                "-f",
-                db_dump,
-                "-q",  # Quiet mode since we're capturing output anyway
+                "-t",
+                "-c",
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public';"
             ]
-            # Capture output to prevent flooding console
-            result = subprocess.run(restore_cmd, env=env, capture_output=True, text=True)
-            if result.returncode != 0:
-                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
-                self.log(f"psql restore stderr: {error_msg}", "error")
-                raise subprocess.CalledProcessError(result.returncode, restore_cmd, result.stdout, result.stderr)
+            result = subprocess.run(verify_cmd, env=env, capture_output=True, text=True)
+            if result.returncode == 0:
+                table_count = result.stdout.strip()
+                self.log(f"Database restored with {table_count} tables in public schema")
+                if int(table_count) == 0:
+                    self.log("WARNING: No tables found after restore - the dump file may be invalid", "warning")
 
             self.log(f"Database restored successfully")
             self.update_progress(70, "Database restore complete")
@@ -818,6 +962,136 @@ class OdooBench:
 
         except Exception as e:
             self.log(f"Error restoring database: {str(e)}", "error")
+            raise
+
+    def _restore_remote_database(self, config, db_dump):
+        """Restore database by running psql on the remote server via SSH
+
+        This uploads the dump file and runs psql on the remote server,
+        which is necessary when the database is only accessible from there.
+        """
+        ssh_conn = self.conn_manager.get_ssh_connection(config["ssh_connection_id"])
+        if not ssh_conn:
+            self.log("Error: SSH connection not found, falling back to local restore", "warning")
+            return self._restore_local_database(config, db_dump)
+
+        self.log("Running database restore on remote server...")
+
+        try:
+            ssh = self._get_ssh_client(ssh_conn)
+
+            # Upload the dump file to the remote server (compressed for speed)
+            remote_dump = f"/tmp/pgrestore_{config['db_name']}_{self.timestamp}.sql"
+            remote_dump_gz = f"{remote_dump}.gz"
+            local_dump_gz = f"{db_dump}.gz"
+
+            # Compress the dump file locally for faster upload
+            self.log("Compressing dump file for upload...")
+            import gzip
+            with open(db_dump, 'rb') as f_in:
+                with gzip.open(local_dump_gz, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+
+            # Get file sizes for logging
+            local_size_mb = os.path.getsize(local_dump_gz) / (1024 * 1024)
+            self.log(f"Compressed dump file size: {local_size_mb:.1f} MB")
+
+            # Upload via SFTP
+            self.log("Uploading dump file to remote server...")
+            self.update_progress(35, "Uploading database dump...")
+            sftp = ssh.open_sftp()
+            try:
+                sftp.put(local_dump_gz, remote_dump_gz)
+            finally:
+                sftp.close()
+
+            # Clean up local compressed file
+            os.remove(local_dump_gz)
+
+            # Decompress on remote server
+            self.log("Decompressing dump file on remote server...")
+            stdin, stdout, stderr = ssh.exec_command(f"gunzip -f {remote_dump_gz}")
+            stdout.channel.recv_exit_status()
+
+            # Build database connection parameters
+            db_host = config.get("db_host", "localhost")
+            db_port = config.get("db_port", 5432)
+            db_user = config.get("db_user", "odoo")
+            db_name = config["db_name"]
+            db_password = config.get("db_password", "")
+
+            # Set up PGPASSWORD prefix
+            pg_env = f"PGPASSWORD='{db_password}' " if db_password else ""
+
+            # Check if database exists
+            self.log("Checking if database exists...")
+            check_cmd = f"{pg_env}psql -h {db_host} -p {db_port} -U {db_user} -lqt"
+            stdin, stdout, stderr = ssh.exec_command(check_cmd)
+            stdout.channel.recv_exit_status()
+            db_list = stdout.read().decode()
+
+            db_exists = False
+            for line in db_list.split('\n'):
+                parts = line.split('|')
+                if parts and parts[0].strip() == db_name:
+                    db_exists = True
+                    break
+
+            if db_exists:
+                # Terminate connections and drop database
+                self.log(f"Dropping existing database: {db_name}...")
+                terminate_cmd = f"{pg_env}psql -h {db_host} -p {db_port} -U {db_user} -d postgres -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}' AND pid <> pg_backend_pid();\""
+                stdin, stdout, stderr = ssh.exec_command(terminate_cmd)
+                stdout.channel.recv_exit_status()
+
+                drop_cmd = f"{pg_env}dropdb --if-exists -h {db_host} -p {db_port} -U {db_user} {db_name}"
+                stdin, stdout, stderr = ssh.exec_command(drop_cmd)
+                exit_status = stdout.channel.recv_exit_status()
+                if exit_status != 0:
+                    error_msg = stderr.read().decode()
+                    self.log(f"Remote dropdb failed: {error_msg}", "error")
+                    raise Exception(f"Remote dropdb failed: {error_msg}")
+
+            # Create database
+            self.log(f"Creating database: {db_name}...")
+            create_cmd = f"{pg_env}createdb -h {db_host} -p {db_port} -U {db_user} {db_name}"
+            stdin, stdout, stderr = ssh.exec_command(create_cmd)
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status != 0:
+                error_msg = stderr.read().decode()
+                self.log(f"Remote createdb failed: {error_msg}", "error")
+                raise Exception(f"Remote createdb failed: {error_msg}")
+
+            # Restore database
+            self.log("Restoring database from dump file...")
+            self.update_progress(50, "Importing database data...")
+            restore_cmd = f"{pg_env}psql -h {db_host} -p {db_port} -U {db_user} -d {db_name} -f {remote_dump} -q"
+            stdin, stdout, stderr = ssh.exec_command(restore_cmd)
+            exit_status = stdout.channel.recv_exit_status()
+
+            # psql may return warnings but still succeed - only fail on actual errors
+            if exit_status != 0:
+                error_msg = stderr.read().decode()
+                # Filter out common non-fatal warnings
+                fatal_errors = [line for line in error_msg.split('\n')
+                               if 'ERROR:' in line or 'FATAL:' in line]
+                if fatal_errors:
+                    self.log(f"Remote psql restore failed: {error_msg}", "error")
+                    raise Exception(f"Remote psql restore failed: {error_msg}")
+                else:
+                    self.log(f"psql completed with warnings: {error_msg[:200]}...", "warning")
+
+            # Clean up remote temp file
+            self.log("Cleaning up remote temporary file...")
+            ssh.exec_command(f"rm -f {remote_dump}")
+            ssh.close()
+
+            self.log(f"Database restored successfully")
+            self.update_progress(70, "Database restore complete")
+            return True
+
+        except Exception as e:
+            self.log(f"Error restoring remote database: {str(e)}", "error")
             raise
 
     def restore_filestore(self, config, filestore_archive):

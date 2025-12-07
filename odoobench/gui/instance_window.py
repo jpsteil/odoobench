@@ -8,6 +8,7 @@ from tkinter import ttk, messagebox, filedialog
 import tkinter.font as tkfont
 import threading
 import os
+import re
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
@@ -68,6 +69,13 @@ class InstanceWindow:
 
         # Bind close event to save state
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Bind Configure event to save geometry/layout when window is resized/moved
+        self._geometry_save_pending = False
+        self.root.bind('<Configure>', self._on_configure)
+
+        # Start periodic autosave (every 30 seconds)
+        self._start_autosave()
 
     def _create_menu(self):
         """Create the menu bar"""
@@ -564,7 +572,7 @@ class InstanceWindow:
             text_bg = "#ffffff"
             text_fg = "#000000"
 
-        log_text = tk.Text(log_frame, wrap=tk.NONE, font=('Consolas', 9),
+        log_text = tk.Text(log_frame, wrap=tk.NONE, font='TkFixedFont',
                            bg=text_bg, fg=text_fg, insertbackground=text_fg)
         log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._add_text_context_menu(log_text)
@@ -837,36 +845,135 @@ class InstanceWindow:
         feature_notebook.add(tab, text="Database")
         conn_info['tabs']['database'] = tab
 
-        # Info frame
-        info_frame = ttk.LabelFrame(tab, text="Database Connection", padding=10)
-        info_frame.pack(fill=tk.X, padx=10, pady=10)
+        # Get theme colors
+        is_dark = self.dark_mode_var.get()
+        if is_dark:
+            text_bg = "#1e1e1e"
+            text_fg = "#d4d4d4"
+        else:
+            text_bg = "#ffffff"
+            text_fg = "#000000"
 
-        row = 0
+        # Connection info frame (compact, top)
+        info_frame = ttk.LabelFrame(tab, text="Connection", padding=5)
+        info_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+
+        info_inner = ttk.Frame(info_frame)
+        info_inner.pack(fill=tk.X)
+        col = 0
         for label, key in [("Host:", 'db_host'), ("Port:", 'db_port'),
                            ("User:", 'db_user'), ("Database:", 'db_name')]:
-            ttk.Label(info_frame, text=label).grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
-            ttk.Label(info_frame, text=str(instance.get(key, 'N/A'))).grid(row=row, column=1, sticky=tk.W, padx=5, pady=2)
-            row += 1
+            ttk.Label(info_inner, text=label).grid(row=0, column=col, sticky=tk.W, padx=(10, 2))
+            ttk.Label(info_inner, text=str(instance.get(key, 'N/A')),
+                      font=('TkDefaultFont', 9, 'bold')).grid(row=0, column=col+1, sticky=tk.W, padx=(0, 15))
+            col += 2
 
         # Actions frame
-        actions_frame = ttk.LabelFrame(tab, text="Actions", padding=10)
-        actions_frame.pack(fill=tk.X, padx=10, pady=10)
+        actions_frame = ttk.Frame(tab)
+        actions_frame.pack(fill=tk.X, padx=10, pady=5)
 
+        ttk.Button(actions_frame, text="Refresh All",
+                   command=lambda: self._refresh_database_info(instance_id)).pack(side=tk.LEFT, padx=5)
         ttk.Button(actions_frame, text="Test Connection",
                    command=lambda: self._test_db_connection(instance_id)).pack(side=tk.LEFT, padx=5)
         ttk.Button(actions_frame, text="List Databases",
                    command=lambda: self._list_databases(instance_id)).pack(side=tk.LEFT, padx=5)
 
-        # Results area
-        results_frame = ttk.LabelFrame(tab, text="Results", padding=10)
-        results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # PostgreSQL Version label
+        version_label = ttk.Label(actions_frame, text="PostgreSQL: --")
+        version_label.pack(side=tk.RIGHT, padx=10)
 
-        results_text = tk.Text(results_frame, height=15, font=('Consolas', 9))
+        # Health Dashboard frame
+        health_frame = ttk.LabelFrame(tab, text="Health Dashboard", padding=10)
+        health_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # Create health metrics grid
+        health_grid = ttk.Frame(health_frame)
+        health_grid.pack(fill=tk.X)
+
+        # Row 1: Key metrics
+        health_labels = {}
+        metrics = [
+            ('db_size', 'Database Size:', '--'),
+            ('cache_ratio', 'Cache Hit Ratio:', '--'),
+            ('connections', 'Connections:', '--'),
+            ('vacuum_needed', 'Tables Need Vacuum:', '--'),
+        ]
+        for col, (key, label, default) in enumerate(metrics):
+            frame = ttk.Frame(health_grid)
+            frame.grid(row=0, column=col, padx=10, pady=5, sticky=tk.W)
+            ttk.Label(frame, text=label).pack(anchor=tk.W)
+            value_label = ttk.Label(frame, text=default, font=('TkDefaultFont', 11, 'bold'))
+            value_label.pack(anchor=tk.W)
+            health_labels[key] = value_label
+
+        # PostgreSQL Settings frame
+        settings_frame = ttk.LabelFrame(tab, text="PostgreSQL Settings", padding=10)
+        settings_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # Create settings treeview
+        settings_tree = ttk.Treeview(settings_frame,
+                                      columns=('setting', 'current', 'recommended', 'status'),
+                                      show='headings', height=9)
+        settings_tree.heading('setting', text='Setting')
+        settings_tree.heading('current', text='Current Value')
+        settings_tree.heading('recommended', text='Recommended')
+        settings_tree.heading('status', text='Status')
+        settings_tree.column('setting', width=200, anchor=tk.W)
+        settings_tree.column('current', width=150, anchor=tk.E)
+        settings_tree.column('recommended', width=150, anchor=tk.E)
+        settings_tree.column('status', width=100, anchor=tk.CENTER)
+
+        settings_tree.pack(fill=tk.X, expand=True)
+
+        # Configure tags for status colors
+        settings_tree.tag_configure('good', foreground='#28a745')
+        settings_tree.tag_configure('warning', foreground='#ffc107')
+        settings_tree.tag_configure('bad', foreground='#dc3545')
+        settings_tree.tag_configure('info', foreground=text_fg)
+
+        # Server memory label
+        memory_label = ttk.Label(settings_frame, text="Server RAM: -- (recommendations based on detected RAM)")
+        memory_label.pack(anchor=tk.W, pady=(5, 0))
+
+        # Top Tables frame (vacuum status)
+        tables_frame = ttk.LabelFrame(tab, text="Table Maintenance Status", padding=10)
+        tables_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        tables_tree = ttk.Treeview(tables_frame,
+                                    columns=('table', 'last_vacuum', 'last_autovacuum', 'last_analyze'),
+                                    show='headings', height=5)
+        tables_tree.heading('table', text='Table')
+        tables_tree.heading('last_vacuum', text='Last Vacuum')
+        tables_tree.heading('last_autovacuum', text='Last Auto-Vacuum')
+        tables_tree.heading('last_analyze', text='Last Analyze')
+        tables_tree.column('table', width=200, anchor=tk.W)
+        tables_tree.column('last_vacuum', width=150, anchor=tk.W)
+        tables_tree.column('last_autovacuum', width=150, anchor=tk.W)
+        tables_tree.column('last_analyze', width=150, anchor=tk.W)
+
+        tables_tree.pack(fill=tk.X, expand=True)
+
+        # Results/Messages area - this one expands to fill remaining space
+        results_frame = ttk.LabelFrame(tab, text="Messages", padding=10)
+        results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
+
+        results_text = tk.Text(results_frame, height=4, font='TkFixedFont',
+                               bg=text_bg, fg=text_fg)
         results_text.pack(fill=tk.BOTH, expand=True)
+        self._add_text_context_menu(results_text)
 
         conn_info['tabs']['database_widgets'] = {
             'results_text': results_text,
+            'version_label': version_label,
+            'health_labels': health_labels,
+            'settings_tree': settings_tree,
+            'memory_label': memory_label,
+            'tables_tree': tables_tree,
         }
+
+        # Auto-refresh on tab creation
+        self.root.after(500, lambda: self._refresh_database_info(instance_id))
 
     def _test_db_connection(self, instance_id: int):
         """Test database connection"""
@@ -921,6 +1028,332 @@ class InstanceWindow:
         text_widget.delete('1.0', tk.END)
         text_widget.insert('1.0', message)
         text_widget.configure(state=tk.DISABLED)
+
+    def _refresh_database_info(self, instance_id: int):
+        """Refresh all database information"""
+        if instance_id not in self.open_connections:
+            return
+
+        conn_info = self.open_connections[instance_id]
+        instance = conn_info['instance']
+        executor = conn_info['executor']
+        widgets = conn_info['tabs'].get('database_widgets', {})
+
+        if not widgets:
+            return
+
+        results_text = widgets.get('results_text')
+        if results_text:
+            self._show_db_result(results_text, "Fetching database information...")
+
+        def fetch_info():
+            parser = OdooConfigParser(executor)
+
+            db_host = instance.get('db_host', 'localhost')
+            db_port = instance.get('db_port', 5432)
+            db_user = instance.get('db_user', 'odoo')
+            db_password = instance.get('db_password', '')
+            db_name = instance.get('db_name', '') or 'postgres'
+
+            # Fetch all data
+            version = parser.get_postgresql_version(db_host, db_port, db_user, db_password)
+            settings = parser.get_postgresql_settings(db_host, db_port, db_user, db_password, db_name)
+            stats = parser.get_database_stats(db_host, db_port, db_user, db_password, db_name)
+            server_ram = parser.get_server_memory()
+
+            # Update UI on main thread
+            self.root.after(0, lambda: self._update_database_display(
+                instance_id, version, settings, stats, server_ram
+            ))
+
+        threading.Thread(target=fetch_info, daemon=True).start()
+
+    def _update_database_display(self, instance_id: int, version: str, settings: dict,
+                                  stats: dict, server_ram: int):
+        """Update the database tab display with fetched data"""
+        if instance_id not in self.open_connections:
+            return
+
+        conn_info = self.open_connections[instance_id]
+        widgets = conn_info['tabs'].get('database_widgets', {})
+
+        if not widgets:
+            return
+
+        # Update version label
+        version_label = widgets.get('version_label')
+        if version_label and version:
+            # Extract just the version number
+            match = re.search(r'PostgreSQL (\d+\.\d+)', version)
+            if match:
+                version_label.configure(text=f"PostgreSQL: {match.group(1)}")
+            else:
+                version_label.configure(text=f"PostgreSQL: {version[:30]}...")
+
+        # Update health labels
+        health_labels = widgets.get('health_labels', {})
+
+        if 'db_size' in stats and health_labels.get('db_size'):
+            size_bytes = stats['db_size']
+            size_str = self._format_bytes(size_bytes)
+            health_labels['db_size'].configure(text=size_str)
+
+        if 'cache_hit_ratio' in stats and health_labels.get('cache_ratio'):
+            ratio = stats['cache_hit_ratio']
+            color = '#28a745' if ratio >= 99 else '#ffc107' if ratio >= 95 else '#dc3545'
+            health_labels['cache_ratio'].configure(text=f"{ratio}%", foreground=color)
+
+        if 'active_connections' in stats and health_labels.get('connections'):
+            active = stats.get('active_connections', 0)
+            max_conn = stats.get('max_connections', 100)
+            pct = (active / max_conn * 100) if max_conn > 0 else 0
+            color = '#28a745' if pct < 50 else '#ffc107' if pct < 80 else '#dc3545'
+            health_labels['connections'].configure(text=f"{active} / {max_conn}", foreground=color)
+
+        if 'tables_needing_vacuum' in stats and health_labels.get('vacuum_needed'):
+            count = stats['tables_needing_vacuum']
+            color = '#28a745' if count == 0 else '#ffc107' if count < 5 else '#dc3545'
+            health_labels['vacuum_needed'].configure(text=str(count), foreground=color)
+
+        # Update settings tree
+        settings_tree = widgets.get('settings_tree')
+        if settings_tree and not settings.get('error'):
+            # Clear existing items
+            for item in settings_tree.get_children():
+                settings_tree.delete(item)
+
+            # Calculate recommendations based on server RAM
+            recommendations = self._calculate_pg_recommendations(server_ram)
+
+            # Settings to display with their recommendations
+            settings_info = [
+                ('shared_buffers', 'Shared Buffers', 'shared_buffers'),
+                ('effective_cache_size', 'Effective Cache Size', 'effective_cache_size'),
+                ('work_mem', 'Work Memory', 'work_mem'),
+                ('maintenance_work_mem', 'Maintenance Work Memory', 'maintenance_work_mem'),
+                ('max_connections', 'Max Connections', 'max_connections'),
+                ('random_page_cost', 'Random Page Cost', 'random_page_cost'),
+                ('effective_io_concurrency', 'Effective I/O Concurrency', 'effective_io_concurrency'),
+                ('checkpoint_completion_target', 'Checkpoint Completion Target', 'checkpoint_completion_target'),
+                ('wal_buffers', 'WAL Buffers', 'wal_buffers'),
+            ]
+
+            for setting_key, display_name, rec_key in settings_info:
+                if setting_key in settings:
+                    setting = settings[setting_key]
+                    current = self._format_pg_setting(setting['value'], setting['unit'])
+                    recommended = recommendations.get(rec_key, 'N/A')
+                    status, tag = self._evaluate_pg_setting(setting_key, setting, recommendations)
+
+                    settings_tree.insert('', tk.END, values=(display_name, current, recommended, status), tags=(tag,))
+
+        # Update memory label
+        memory_label = widgets.get('memory_label')
+        if memory_label and server_ram:
+            ram_str = self._format_bytes(server_ram)
+            memory_label.configure(text=f"Server RAM: {ram_str} (recommendations based on detected RAM)")
+        elif memory_label:
+            memory_label.configure(text="Server RAM: Unknown (using conservative recommendations)")
+
+        # Update tables tree
+        tables_tree = widgets.get('tables_tree')
+        if tables_tree and 'top_tables' in stats:
+            for item in tables_tree.get_children():
+                tables_tree.delete(item)
+
+            for table in stats['top_tables']:
+                tables_tree.insert('', tk.END, values=(
+                    table['name'],
+                    self._format_timestamp(table['last_vacuum']),
+                    self._format_timestamp(table['last_autovacuum']),
+                    self._format_timestamp(table['last_analyze']),
+                ))
+
+        # Update results text
+        results_text = widgets.get('results_text')
+        if results_text:
+            if settings.get('error'):
+                self._show_db_result(results_text, f"Error fetching settings: {settings['error']}")
+            else:
+                self._show_db_result(results_text, "Database information refreshed successfully.")
+
+    def _format_bytes(self, bytes_val: int) -> str:
+        """Format bytes to human readable string"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if abs(bytes_val) < 1024:
+                return f"{bytes_val:.1f} {unit}"
+            bytes_val /= 1024
+        return f"{bytes_val:.1f} PB"
+
+    def _format_pg_setting(self, value: str, unit: str) -> str:
+        """Format a PostgreSQL setting value with its unit"""
+        try:
+            val = float(value)
+            if unit == '8kB':
+                # Convert to MB for readability
+                mb = (val * 8) / 1024
+                if mb >= 1024:
+                    return f"{mb / 1024:.1f} GB"
+                return f"{mb:.0f} MB"
+            elif unit == 'kB':
+                if val >= 1024:
+                    return f"{val / 1024:.0f} MB"
+                return f"{val:.0f} KB"
+            elif unit == 'MB':
+                if val >= 1024:
+                    return f"{val / 1024:.1f} GB"
+                return f"{val:.0f} MB"
+            elif unit:
+                return f"{value} {unit}"
+            else:
+                return value
+        except (ValueError, TypeError):
+            return f"{value} {unit}" if unit else value
+
+    def _format_timestamp(self, ts: str) -> str:
+        """Format a timestamp for display"""
+        if not ts or ts == 'Never':
+            return 'Never'
+        # Truncate to just date and time
+        if ' ' in ts:
+            parts = ts.split('.')
+            return parts[0] if parts else ts
+        return ts
+
+    def _calculate_pg_recommendations(self, server_ram: int) -> dict:
+        """Calculate recommended PostgreSQL settings based on server RAM"""
+        recommendations = {}
+
+        if server_ram:
+            ram_gb = server_ram / (1024 ** 3)
+
+            # shared_buffers: ~25% of RAM, max ~8GB for most workloads
+            shared_gb = min(ram_gb * 0.25, 8)
+            if shared_gb >= 1:
+                recommendations['shared_buffers'] = f"{shared_gb:.1f} GB"
+            else:
+                recommendations['shared_buffers'] = f"{int(shared_gb * 1024)} MB"
+
+            # effective_cache_size: ~50-75% of RAM
+            cache_gb = ram_gb * 0.5
+            recommendations['effective_cache_size'] = f"{cache_gb:.1f} GB"
+
+            # work_mem: depends on max_connections, typically 16-64MB
+            recommendations['work_mem'] = "32 MB"
+
+            # maintenance_work_mem: 256MB to 1GB
+            maint_mb = min(max(256, ram_gb * 64), 1024)
+            recommendations['maintenance_work_mem'] = f"{int(maint_mb)} MB"
+        else:
+            # Conservative defaults when RAM is unknown
+            recommendations['shared_buffers'] = "256 MB"
+            recommendations['effective_cache_size'] = "1 GB"
+            recommendations['work_mem'] = "16 MB"
+            recommendations['maintenance_work_mem'] = "256 MB"
+
+        # Fixed recommendations
+        recommendations['max_connections'] = "100-200"
+        recommendations['random_page_cost'] = "1.1 (SSD)"
+        recommendations['effective_io_concurrency'] = "200 (SSD)"
+        recommendations['checkpoint_completion_target'] = "0.9"
+        recommendations['wal_buffers'] = "64 MB"
+
+        return recommendations
+
+    def _evaluate_pg_setting(self, setting_name: str, setting: dict, recommendations: dict) -> tuple:
+        """Evaluate if a PostgreSQL setting is optimal, returns (status_text, tag)"""
+        try:
+            value = float(setting['value'])
+            unit = setting['unit']
+
+            # Convert to common unit (MB) for comparison
+            if unit == '8kB':
+                value_mb = (value * 8) / 1024
+            elif unit == 'kB':
+                value_mb = value / 1024
+            elif unit == 'MB':
+                value_mb = value
+            else:
+                value_mb = value
+
+            if setting_name == 'shared_buffers':
+                # shared_buffers should be at least 256MB
+                if value_mb >= 256:
+                    return ('Good', 'good')
+                elif value_mb >= 128:
+                    return ('Low', 'warning')
+                else:
+                    return ('Too Low', 'bad')
+
+            elif setting_name == 'effective_cache_size':
+                # Should be at least 1GB
+                if value_mb >= 1024:
+                    return ('Good', 'good')
+                elif value_mb >= 512:
+                    return ('Low', 'warning')
+                else:
+                    return ('Too Low', 'bad')
+
+            elif setting_name == 'work_mem':
+                # 4-64MB is reasonable
+                if 4 <= value_mb <= 128:
+                    return ('Good', 'good')
+                elif value_mb < 4:
+                    return ('Too Low', 'warning')
+                else:
+                    return ('High', 'warning')
+
+            elif setting_name == 'maintenance_work_mem':
+                if value_mb >= 256:
+                    return ('Good', 'good')
+                elif value_mb >= 64:
+                    return ('OK', 'warning')
+                else:
+                    return ('Low', 'bad')
+
+            elif setting_name == 'random_page_cost':
+                # 1.1 for SSD, 4.0 for HDD
+                if value <= 1.5:
+                    return ('SSD', 'good')
+                elif value <= 2.0:
+                    return ('OK', 'info')
+                else:
+                    return ('HDD Default', 'warning')
+
+            elif setting_name == 'effective_io_concurrency':
+                if value >= 100:
+                    return ('SSD', 'good')
+                elif value >= 2:
+                    return ('OK', 'info')
+                else:
+                    return ('Default', 'warning')
+
+            elif setting_name == 'checkpoint_completion_target':
+                if value >= 0.9:
+                    return ('Good', 'good')
+                elif value >= 0.7:
+                    return ('OK', 'info')
+                else:
+                    return ('Low', 'warning')
+
+            elif setting_name == 'max_connections':
+                if 50 <= value <= 200:
+                    return ('Good', 'good')
+                elif value > 200:
+                    return ('High', 'warning')
+                else:
+                    return ('Low', 'warning')
+
+            elif setting_name == 'wal_buffers':
+                if value_mb >= 16:
+                    return ('Good', 'good')
+                else:
+                    return ('Default', 'info')
+
+        except (ValueError, TypeError, KeyError):
+            pass
+
+        return ('--', 'info')
 
     def _create_backup_tab(self, instance_id: int):
         """Create the Backup feature tab"""
@@ -1014,7 +1447,7 @@ class InstanceWindow:
         log_frame = ttk.LabelFrame(tab, text="Backup Log", padding=10)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
 
-        log_text = tk.Text(log_frame, height=12, font=('Consolas', 9),
+        log_text = tk.Text(log_frame, height=12, font='TkFixedFont',
                            bg=text_bg, fg=text_fg, insertbackground=text_fg)
         log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._add_text_context_menu(log_text)
@@ -1278,7 +1711,7 @@ class InstanceWindow:
         list_frame = ttk.Frame(recent_frame)
         list_frame.pack(fill=tk.X, pady=5)
 
-        recent_listbox = tk.Listbox(list_frame, height=4, font=('Consolas', 9),
+        recent_listbox = tk.Listbox(list_frame, height=4, font='TkFixedFont',
                                      bg=text_bg, fg=text_fg,
                                      selectbackground="#214283" if is_dark else "#0078d4")
         recent_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -1367,7 +1800,7 @@ class InstanceWindow:
         log_frame = ttk.LabelFrame(tab, text="Restore Log", padding=10)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
 
-        log_text = tk.Text(log_frame, height=8, font=('Consolas', 9),
+        log_text = tk.Text(log_frame, height=8, font='TkFixedFont',
                            bg=text_bg, fg=text_fg, insertbackground=text_fg)
         log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._add_text_context_menu(log_text)
@@ -1725,7 +2158,7 @@ class InstanceWindow:
         log_frame = ttk.LabelFrame(tab, text="Operation Log", padding=10)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
 
-        log_text = tk.Text(log_frame, height=10, font=('Consolas', 9),
+        log_text = tk.Text(log_frame, height=10, font='TkFixedFont',
                            bg=text_bg, fg=text_fg, insertbackground=text_fg)
         log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._add_text_context_menu(log_text)
@@ -2050,7 +2483,7 @@ class InstanceWindow:
         detail_frame = ttk.LabelFrame(tab, text="Operation Log", padding=10)
         detail_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
 
-        log_text = tk.Text(detail_frame, height=12, font=('Consolas', 9),
+        log_text = tk.Text(detail_frame, height=12, font='TkFixedFont',
                            bg=text_bg, fg=text_fg, insertbackground=text_fg)
         log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._add_text_context_menu(log_text)
@@ -2549,6 +2982,38 @@ class InstanceWindow:
     # Window geometry and state persistence
     # -------------------------------------------------------------------------
 
+    def _on_configure(self, event):
+        """Handle window configure events (resize/move) - debounced save."""
+        # Only save when it's the root window being configured
+        if event.widget == self.root:
+            # Debounce: cancel previous pending save and schedule a new one
+            if self._geometry_save_pending:
+                self.root.after_cancel(self._geometry_save_pending)
+            # Save after 500ms of no resize/move activity
+            self._geometry_save_pending = self.root.after(500, self._save_geometry_debounced)
+
+    def _save_geometry_debounced(self):
+        """Save geometry after debounce period."""
+        self._geometry_save_pending = False
+        self._save_geometry()
+        self._save_layout()
+
+    def _start_autosave(self):
+        """Start periodic autosave of window state."""
+        def autosave():
+            try:
+                self._save_geometry()
+                self._save_layout()
+                self._save_active_tab()
+                self._save_open_connections()
+            except Exception:
+                pass  # Silently ignore errors during autosave
+            # Schedule next autosave in 30 seconds
+            self.root.after(30000, autosave)
+
+        # Start first autosave after 10 seconds
+        self.root.after(10000, autosave)
+
     def _restore_geometry(self):
         """Restore window geometry from saved settings."""
         default_geometry = "1200x700"
@@ -2594,8 +3059,11 @@ class InstanceWindow:
 
     def _save_geometry(self):
         """Save current window geometry."""
-        geometry = self.root.geometry()
-        self.instance_manager.set_setting("window_geometry", geometry)
+        try:
+            geometry = self.root.geometry()
+            self.instance_manager.set_setting("window_geometry", geometry)
+        except Exception:
+            pass
 
     def _restore_layout(self):
         """Restore paned window sash positions."""
@@ -2641,27 +3109,69 @@ class InstanceWindow:
             pass
 
     def _save_open_connections(self):
-        """Save list of open connection IDs."""
+        """Save list of open connection IDs and their active feature tabs."""
         try:
-            open_ids = list(self.open_connections.keys())
             import json
-            self.instance_manager.set_setting("open_connections", json.dumps(open_ids))
+            # Save connection IDs along with their active feature tab index
+            connection_state = {}
+            for instance_id, conn_info in self.open_connections.items():
+                feature_tab_idx = 0
+                try:
+                    feature_notebook = conn_info.get('feature_notebook')
+                    if feature_notebook:
+                        current = feature_notebook.select()
+                        if current:
+                            tabs = feature_notebook.tabs()
+                            feature_tab_idx = tabs.index(current) if current in tabs else 0
+                except Exception:
+                    pass
+                connection_state[str(instance_id)] = {'feature_tab': feature_tab_idx}
+
+            self.instance_manager.set_setting("open_connections", json.dumps(connection_state))
         except Exception:
             pass
 
     def _restore_open_connections(self):
-        """Restore previously open connections."""
+        """Restore previously open connections and their feature tabs."""
         try:
             import json
             saved = self.instance_manager.get_setting("open_connections")
             if saved:
-                open_ids = json.loads(saved)
-                for instance_id in open_ids:
-                    instance = self.instance_manager.get_instance(instance_id)
-                    if instance:
-                        self._open_connection(instance)
-                # Restore active tab after opening all connections
+                connection_state = json.loads(saved)
+                # Handle old format (list of IDs) and new format (dict with state)
+                if isinstance(connection_state, list):
+                    # Old format - just IDs
+                    for instance_id in connection_state:
+                        instance = self.instance_manager.get_instance(instance_id)
+                        if instance:
+                            self._open_connection(instance)
+                else:
+                    # New format - dict with state
+                    for instance_id_str, state in connection_state.items():
+                        instance_id = int(instance_id_str)
+                        instance = self.instance_manager.get_instance(instance_id)
+                        if instance:
+                            self._open_connection(instance)
+                            # Restore feature tab after a delay
+                            feature_tab_idx = state.get('feature_tab', 0)
+                            if feature_tab_idx > 0:
+                                self.root.after(300, lambda iid=instance_id, idx=feature_tab_idx:
+                                               self._restore_feature_tab(iid, idx))
+
+                # Restore active connection tab after opening all connections
                 self._restore_active_tab()
+        except Exception:
+            pass
+
+    def _restore_feature_tab(self, instance_id: int, tab_idx: int):
+        """Restore the active feature tab for a connection."""
+        try:
+            if instance_id in self.open_connections:
+                feature_notebook = self.open_connections[instance_id].get('feature_notebook')
+                if feature_notebook:
+                    tabs = feature_notebook.tabs()
+                    if 0 <= tab_idx < len(tabs):
+                        feature_notebook.select(tabs[tab_idx])
         except Exception:
             pass
 
