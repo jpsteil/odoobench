@@ -545,7 +545,8 @@ class InstanceWindow:
         filter_var = tk.StringVar()
         filter_entry = ttk.Entry(filter_frame, textvariable=filter_var, width=30)
         filter_entry.pack(side=tk.LEFT, padx=5)
-        filter_entry.bind('<Return>', lambda e: self._apply_log_filter(instance_id))
+        # Filter as you type (with slight delay to avoid filtering on every keystroke)
+        filter_var.trace_add('write', lambda *args: self._schedule_log_filter(instance_id))
 
         # Level filter
         ttk.Label(filter_frame, text="Level:").pack(side=tk.LEFT, padx=(10, 0))
@@ -558,6 +559,18 @@ class InstanceWindow:
         # Clear button
         ttk.Button(filter_frame, text="Clear Filter",
                    command=lambda: self._clear_log_filter(instance_id)).pack(side=tk.LEFT, padx=5)
+
+        # Find section (right side)
+        ttk.Separator(filter_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill=tk.Y)
+        ttk.Label(filter_frame, text="Find:").pack(side=tk.LEFT)
+        find_var = tk.StringVar()
+        find_entry = ttk.Entry(filter_frame, textvariable=find_var, width=20)
+        find_entry.pack(side=tk.LEFT, padx=5)
+        find_entry.bind('<Return>', lambda e: self._find_in_log(instance_id, forward=True))
+        ttk.Button(filter_frame, text="↑", width=2,
+                   command=lambda: self._find_in_log(instance_id, forward=False)).pack(side=tk.LEFT)
+        ttk.Button(filter_frame, text="↓", width=2,
+                   command=lambda: self._find_in_log(instance_id, forward=True)).pack(side=tk.LEFT)
 
         # Log text area with scrollbar
         log_frame = ttk.Frame(tab)
@@ -614,6 +627,9 @@ class InstanceWindow:
         # Keyboard shortcuts
         log_text.bind('<Control-a>', lambda e: self._log_select_all(log_text))
         log_text.bind('<Control-c>', lambda e: self._log_copy(log_text))
+        log_text.bind('<Control-f>', lambda e: find_entry.focus_set())
+        find_entry.bind('<Control-f>', lambda e: self._find_in_log(instance_id, forward=True))
+        find_entry.bind('<Shift-Return>', lambda e: self._find_in_log(instance_id, forward=False))
 
         # Store references
         conn_info['tabs']['logs_widgets'] = {
@@ -622,6 +638,9 @@ class InstanceWindow:
             'follow_var': follow_var,
             'filter_var': filter_var,
             'level_var': level_var,
+            'find_entry': find_entry,
+            'find_var': find_var,
+            'find_pos': '1.0',  # Current find position
             'log_text': log_text,
             'all_logs': [],  # Store all log lines for filtering
         }
@@ -724,6 +743,10 @@ class InstanceWindow:
         widgets = conn_info['tabs'].get('logs_widgets', {})
         log_text = widgets['log_text']
 
+        # Also store in all_logs for filtering
+        if 'all_logs' in widgets:
+            widgets['all_logs'].append(line)
+
         # Determine tag
         tag = None
         if ' ERROR ' in line:
@@ -742,6 +765,21 @@ class InstanceWindow:
             log_text.insert(tk.END, line + '\n')
         log_text.configure(state=tk.DISABLED)
         log_text.see(tk.END)
+
+    def _schedule_log_filter(self, instance_id: int):
+        """Schedule a log filter with debounce to avoid filtering on every keystroke"""
+        if instance_id not in self.open_connections:
+            return
+
+        conn_info = self.open_connections[instance_id]
+        widgets = conn_info['tabs'].get('logs_widgets', {})
+
+        # Cancel any pending filter
+        if 'filter_after_id' in widgets and widgets['filter_after_id']:
+            self.root.after_cancel(widgets['filter_after_id'])
+
+        # Schedule filter after 150ms delay
+        widgets['filter_after_id'] = self.root.after(150, lambda: self._apply_log_filter(instance_id))
 
     def _apply_log_filter(self, instance_id: int):
         """Apply filter to logs"""
@@ -808,6 +846,56 @@ class InstanceWindow:
         widgets['filter_var'].set('')
         widgets['level_var'].set('ALL')
         self._display_logs(instance_id, widgets.get('all_logs', []))
+
+    def _find_in_log(self, instance_id: int, forward: bool = True):
+        """Find text in log and highlight it"""
+        if instance_id not in self.open_connections:
+            return
+
+        conn_info = self.open_connections[instance_id]
+        widgets = conn_info['tabs'].get('logs_widgets', {})
+        log_text = widgets['log_text']
+        search_text = widgets['find_var'].get()
+
+        if not search_text:
+            return
+
+        # Remove previous highlight
+        log_text.tag_remove('find_highlight', '1.0', tk.END)
+
+        # Get current position
+        current_pos = widgets.get('find_pos', '1.0')
+
+        # Search for text
+        if forward:
+            # Start search from after current position
+            start_pos = current_pos
+            pos = log_text.search(search_text, start_pos, nocase=True, stopindex=tk.END)
+            if not pos:
+                # Wrap around to beginning
+                pos = log_text.search(search_text, '1.0', nocase=True, stopindex=start_pos)
+        else:
+            # Search backwards
+            start_pos = current_pos
+            pos = log_text.search(search_text, start_pos, nocase=True, backwards=True, stopindex='1.0')
+            if not pos:
+                # Wrap around to end
+                pos = log_text.search(search_text, tk.END, nocase=True, backwards=True, stopindex=start_pos)
+
+        if pos:
+            # Highlight the found text
+            end_pos = f"{pos}+{len(search_text)}c"
+            log_text.tag_add('find_highlight', pos, end_pos)
+            log_text.tag_config('find_highlight', background='yellow', foreground='black')
+
+            # Scroll to show the found text
+            log_text.see(pos)
+
+            # Update position for next search
+            if forward:
+                widgets['find_pos'] = end_pos
+            else:
+                widgets['find_pos'] = pos
 
     def _log_select_all(self, log_text: tk.Text):
         """Select all text in log widget"""
