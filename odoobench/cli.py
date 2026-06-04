@@ -189,6 +189,57 @@ Examples:
     config_parser.add_argument("--backup", action="store_true", help="Perform backup")
     config_parser.add_argument("--output-dir", help="Output directory for backup")
 
+    # Docker export command
+    docker_parser = subparsers.add_parser("docker-export", help="Create Docker package")
+    docker_parser.add_argument("--connection", "-c", required=True, help="Source Odoo connection name")
+    docker_parser.add_argument("--profile", "-p", help="Docker export profile name (uses saved profile)")
+    docker_parser.add_argument("--output-dir", help="Output directory for the Docker archive")
+    docker_parser.add_argument("--source-dir", help="Remote source directory base path")
+    docker_parser.add_argument("--subdirs", help="Comma-separated list of source subdirectories")
+    docker_parser.add_argument("--venv-path", help="Path to Python virtual environment")
+    docker_parser.add_argument("--odoo-conf-path", help="Relative path to odoo.conf from source-dir")
+    docker_parser.add_argument("--extra-files", help="Comma-separated extra files to include")
+    docker_parser.add_argument("--pg-version", default="16", help="PostgreSQL version (default: 16)")
+    docker_parser.add_argument("--python-version", default="3.12", help="Python version (default: 3.12)")
+    docker_parser.add_argument("--odoo-port", type=int, default=8069, help="Odoo HTTP port (default: 8069)")
+    docker_parser.add_argument("--mailpit-port", type=int, default=8025, help="Mailpit HTTP port (default: 8025)")
+    docker_parser.add_argument("--git-repo", help="Git repository URL for runtime cloning")
+    docker_parser.add_argument("--git-subdir", help="Subdirectory to clone from git repo")
+
+    # Docker profile management
+    docker_profiles = subparsers.add_parser("docker-profiles", help="Manage Docker export profiles")
+    docker_profiles_sub = docker_profiles.add_subparsers(dest="profile_action", help="Profile actions")
+
+    # List profiles
+    docker_profiles_sub.add_parser("list", help="List saved Docker export profiles")
+
+    # Delete profile
+    docker_profile_delete = docker_profiles_sub.add_parser("delete", help="Delete a Docker export profile")
+    docker_profile_delete.add_argument("name", help="Profile name to delete")
+
+    # Sync command
+    sync_parser = subparsers.add_parser("sync", help="Sync orders between Odoo instances")
+    sync_subparsers = sync_parser.add_subparsers(dest="sync_action", help="Sync actions")
+
+    # Sync run
+    sync_run = sync_subparsers.add_parser("run", help="Run sync from source to target")
+    sync_run.add_argument("--source", "-s", required=True, help="Source connection name (production)")
+    sync_run.add_argument("--target", "-t", required=True, help="Target connection name (replica with allow_sync)")
+    sync_run.add_argument("--batch-size", type=int, default=100, help="Batch size for sync (default: 100)")
+    sync_run.add_argument("--no-deletes", action="store_true", help="Skip delete detection")
+    sync_run.add_argument("--from-date", help="Only sync records modified after this date (YYYY-MM-DD HH:MM:SS). Use for initial sync after backup restore.")
+
+    # Sync stats
+    sync_stats = sync_subparsers.add_parser("stats", help="Show sync statistics")
+    sync_stats.add_argument("--source", "-s", required=True, help="Source connection name")
+    sync_stats.add_argument("--target", "-t", required=True, help="Target connection name")
+
+    # Sync clear
+    sync_clear = sync_subparsers.add_parser("clear", help="Clear sync mappings")
+    sync_clear.add_argument("--source", "-s", help="Source connection name")
+    sync_clear.add_argument("--target", "-t", help="Target connection name")
+    sync_clear.add_argument("--confirm", action="store_true", help="Confirm clearing mappings")
+
     # GUI command (explicit)
     gui_parser = subparsers.add_parser("gui", help="Launch GUI interface")
 
@@ -223,6 +274,12 @@ def handle_cli(parser, args):
         handle_connections(args)
     elif args.command == "from-config":
         handle_from_config(args)
+    elif args.command == "docker-export":
+        handle_docker_export(args)
+    elif args.command == "docker-profiles":
+        handle_docker_profiles(args)
+    elif args.command == "sync":
+        handle_sync(args)
     else:
         parser.print_help()
         sys.exit(1)
@@ -230,21 +287,8 @@ def handle_cli(parser, args):
 
 def launch_gui():
     """Launch the GUI interface"""
-    try:
-        import tkinter as tk
-        from .gui.instance_window import InstanceWindow
-
-        # Set className for proper window manager integration (Linux/X11)
-        # This makes the app icon show correctly in GNOME overview
-        root = tk.Tk(className="odoobench")
-        app = InstanceWindow(root)
-        root.mainloop()
-    except ImportError as e:
-        print("Error: GUI dependencies not available.")
-        print("Please install tkinter: sudo apt-get install python3-tk")
-        print(f"Error details: {e}")
-        print("\nYou can use CLI mode with: odoobench --cli [command]")
-        sys.exit(1)
+    from .gui_launcher import main as gui_main
+    gui_main()
 
 
 def handle_backup(args):
@@ -563,6 +607,302 @@ def handle_from_config(args):
             sys.exit(1)
     else:
         print("Config file loaded. Use --backup to create a backup.")
+
+
+def handle_docker_export(args):
+    """Handle docker-export command"""
+    from .db.odoo_connection_manager import OdooInstanceManager
+    from .docker.exporter import DockerExporter
+    from .utils.config import Config
+    import json
+
+    instance_manager = OdooInstanceManager()
+    config = Config()
+
+    # Get the source connection
+    instance = instance_manager.get_instance_by_name(args.connection)
+    if not instance:
+        print(f"Error: Connection '{args.connection}' not found")
+        print("\nAvailable connections:")
+        for inst in instance_manager.list_instances():
+            print(f"  - {inst['name']}")
+        sys.exit(1)
+
+    # Build the profile from saved profile or command-line args
+    profile = {}
+
+    if args.profile:
+        # Load saved profile
+        saved_profile = instance_manager.get_docker_export_profile_by_name(args.profile)
+        if not saved_profile:
+            print(f"Error: Docker export profile '{args.profile}' not found")
+            print("\nAvailable profiles:")
+            for p in instance_manager.list_docker_export_profiles():
+                print(f"  - {p['name']}")
+            sys.exit(1)
+        profile = saved_profile
+        print(f"Using Docker export profile: {args.profile}")
+    else:
+        # Build profile from command-line args
+        if not args.source_dir:
+            print("Error: --source-dir is required when not using a saved profile")
+            sys.exit(1)
+        if not args.subdirs:
+            print("Error: --subdirs is required when not using a saved profile")
+            sys.exit(1)
+
+        profile = {
+            'source_base_dir': args.source_dir,
+            'source_subdirs': json.dumps(args.subdirs.split(',')),
+            'venv_path': args.venv_path or '',
+            'extra_files': json.dumps(args.extra_files.split(',')) if args.extra_files else '[]',
+            'odoo_conf_path': args.odoo_conf_path or 'odoo/odoo.conf',
+            'container_base_dir': '/opt/odoo/qlf',
+            'postgres_version': args.pg_version,
+            'python_version': args.python_version,
+            'odoo_port': args.odoo_port,
+            'mailpit_http_port': args.mailpit_port,
+            'git_repo_url': args.git_repo or '',
+            'git_clone_subdir': args.git_subdir or '',
+        }
+
+    # Override output directory if specified
+    if args.output_dir:
+        profile['output_dir'] = args.output_dir
+    elif not profile.get('output_dir'):
+        profile['output_dir'] = config.get_backup_dir()
+
+    # Build source config from instance
+    source_config = {
+        'db_name': instance['db_name'],
+        'db_host': instance['db_host'],
+        'db_port': instance['db_port'],
+        'db_user': instance['db_user'],
+        'db_password': instance['db_password'],
+        'filestore_path': instance['filestore_path'],
+        'is_local': instance['is_local'],
+        'host': instance['host'],
+        'ssh_port': instance['ssh_port'],
+        'ssh_username': instance['ssh_username'],
+        'ssh_password': instance['ssh_password'],
+        'ssh_key_path': instance['ssh_key_path'],
+    }
+
+    # Check for SSH connection requirement
+    if not source_config['is_local']:
+        source_config['use_ssh'] = True
+        source_config['ssh_connection_id'] = instance['id']
+
+    print(f"Creating Docker export for: {instance['name']}")
+    print(f"Database: {source_config['db_name']}")
+    print(f"Output directory: {profile['output_dir']}")
+    print()
+
+    try:
+        exporter = DockerExporter(conn_manager=instance_manager)
+        output_path = exporter.export(source_config, profile)
+        print()
+        print(f"Docker export completed successfully: {output_path}")
+    except Exception as e:
+        print(f"Docker export failed: {e}")
+        sys.exit(1)
+
+
+def handle_docker_profiles(args):
+    """Handle docker-profiles command"""
+    from .db.odoo_connection_manager import OdooInstanceManager
+
+    instance_manager = OdooInstanceManager()
+
+    if args.profile_action == "list":
+        profiles = instance_manager.list_docker_export_profiles()
+        if not profiles:
+            print("No Docker export profiles found.")
+        else:
+            print("\nDocker Export Profiles:")
+            print("-" * 60)
+            for p in profiles:
+                instance_name = p.get('instance_name', 'N/A')
+                print(f"  {p['name']}")
+                print(f"    Instance: {instance_name}")
+                print(f"    Source: {p.get('source_base_dir', 'N/A')}")
+                print(f"    Python: {p.get('python_version', '3.12')}")
+                print(f"    PostgreSQL: {p.get('postgres_version', '16')}")
+                print()
+
+    elif args.profile_action == "delete":
+        profile = instance_manager.get_docker_export_profile_by_name(args.name)
+        if not profile:
+            print(f"Error: Profile '{args.name}' not found")
+            sys.exit(1)
+
+        if instance_manager.delete_docker_export_profile(profile['id']):
+            print(f"Profile '{args.name}' deleted successfully")
+        else:
+            print(f"Failed to delete profile '{args.name}'")
+            sys.exit(1)
+
+    else:
+        print("Error: No profile action specified")
+        print("Use: docker-profiles list|delete")
+        sys.exit(1)
+
+
+def handle_sync(args):
+    """Handle sync command"""
+    from .db.odoo_connection_manager import OdooInstanceManager
+
+    instance_manager = OdooInstanceManager()
+
+    if args.sync_action == "run":
+        try:
+            from .sync import SyncEngine
+        except ImportError as e:
+            print(f"Error: Could not import sync module: {e}")
+            print("Make sure odoorpc is installed: pip install odoorpc")
+            sys.exit(1)
+
+        # Get source instance
+        source = instance_manager.get_instance_by_name(args.source)
+        if not source:
+            print(f"Error: Source connection '{args.source}' not found")
+            sys.exit(1)
+
+        # Get target instance
+        target = instance_manager.get_instance_by_name(args.target)
+        if not target:
+            print(f"Error: Target connection '{args.target}' not found")
+            sys.exit(1)
+
+        # Check allow_sync on target
+        if not target.get('allow_sync'):
+            print(f"Error: Target connection '{args.target}' does not have 'Allow Sync' enabled")
+            print("Edit the connection to enable sync operations for this target.")
+            sys.exit(1)
+
+        print(f"Order Sync")
+        print(f"  Source: {args.source} ({source.get('db_name', 'N/A')})")
+        print(f"  Target: {args.target} ({target.get('db_name', 'N/A')})")
+        print(f"  Batch size: {args.batch_size}")
+        print(f"  Delete detection: {'disabled' if args.no_deletes else 'enabled'}")
+        if args.from_date:
+            print(f"  Only records after: {args.from_date}")
+        print()
+
+        # Create sync engine with CLI callbacks
+        def progress_callback(percent, message):
+            print(f"  [{percent:3d}%] {message}")
+
+        def log_callback(message, level):
+            prefix = {'error': 'ERROR', 'warning': 'WARN', 'success': 'OK'}.get(level, 'INFO')
+            print(f"  [{prefix}] {message}")
+
+        engine = SyncEngine(
+            instance_manager=instance_manager,
+            progress_callback=progress_callback,
+            log_callback=log_callback,
+        )
+
+        # Connect
+        if not engine.connect(source['id'], target['id']):
+            print("Failed to connect to one or both instances")
+            sys.exit(1)
+
+        # Run sync
+        try:
+            results = engine.run_full_sync(
+                include_deletes=not args.no_deletes,
+                batch_size=args.batch_size,
+                sync_from_date=args.from_date,
+            )
+            engine.disconnect()
+
+            # Print summary
+            print()
+            print("Sync Complete:")
+            for model, stats in results.get('sync', {}).items():
+                print(f"  {model}:")
+                print(f"    Created: {stats.get('created', 0)}")
+                print(f"    Updated: {stats.get('updated', 0)}")
+                print(f"    Errors: {stats.get('errors', 0)}")
+
+            for model, count in results.get('deletes', {}).items():
+                if count > 0:
+                    print(f"  {model}: {count} deleted")
+
+            if results.get('errors'):
+                print(f"  Errors: {len(results['errors'])}")
+                for err in results['errors']:
+                    print(f"    - {err}")
+
+        except Exception as e:
+            print(f"Sync failed: {e}")
+            sys.exit(1)
+
+    elif args.sync_action == "stats":
+        # Get source instance
+        source = instance_manager.get_instance_by_name(args.source)
+        if not source:
+            print(f"Error: Source connection '{args.source}' not found")
+            sys.exit(1)
+
+        # Get target instance
+        target = instance_manager.get_instance_by_name(args.target)
+        if not target:
+            print(f"Error: Target connection '{args.target}' not found")
+            sys.exit(1)
+
+        stats = instance_manager.get_sync_stats(source['id'], target['id'])
+
+        print(f"Sync Statistics")
+        print(f"  Source: {args.source}")
+        print(f"  Target: {args.target}")
+        print()
+
+        if not stats:
+            print("  No records synced yet.")
+        else:
+            print("  Synced Records:")
+            for model, count in stats.items():
+                print(f"    {model}: {count}")
+
+        # Show last sync time
+        last_sync = instance_manager.get_last_sync_time('sale.order', source['id'], target['id'])
+        print(f"\n  Last sync: {last_sync or 'Never'}")
+
+    elif args.sync_action == "clear":
+        if not args.confirm:
+            print("Error: Use --confirm to confirm clearing sync mappings")
+            print("This will clear all sync tracking data.")
+            sys.exit(1)
+
+        source_id = None
+        target_id = None
+
+        if args.source:
+            source = instance_manager.get_instance_by_name(args.source)
+            if source:
+                source_id = source['id']
+
+        if args.target:
+            target = instance_manager.get_instance_by_name(args.target)
+            if target:
+                target_id = target['id']
+
+        if not source_id and not target_id:
+            print("Error: Specify at least one of --source or --target")
+            sys.exit(1)
+
+        count = instance_manager.delete_sync_mappings_for_instance(
+            source_instance_id=source_id,
+            target_instance_id=target_id,
+        )
+        print(f"Cleared {count} sync mapping(s)")
+
+    else:
+        print("Error: No sync action specified")
+        print("Use: sync run|stats|clear")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

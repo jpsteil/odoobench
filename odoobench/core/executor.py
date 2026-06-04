@@ -223,12 +223,15 @@ class LocalExecutor(ConnectionExecutor):
 
 
 class SSHExecutor(ConnectionExecutor):
-    """Execute commands on a remote machine via SSH"""
+    """Execute commands on a remote machine via SSH.
+
+    Connections are opened and closed per operation (no persistent connection).
+    """
 
     def __init__(self, host: str, port: int = 22, username: str = None,
                  password: str = None, key_path: str = None):
         """
-        Initialize SSH connection
+        Initialize SSH executor (does not connect yet).
 
         Args:
             host: Remote hostname or IP
@@ -242,22 +245,13 @@ class SSHExecutor(ConnectionExecutor):
         self.username = username
         self.password = password
         self.key_path = key_path
-
-        self._client: Optional[paramiko.SSHClient] = None
-        self._sftp: Optional[paramiko.SFTPClient] = None
         self._tail_running = False
-        self._tail_channel = None
+        self._tail_client = None  # Only for tail_file_follow
 
-    def _ensure_connected(self) -> paramiko.SSHClient:
-        """Ensure SSH connection is established"""
-        if self._client is None or not self._client.get_transport() or not self._client.get_transport().is_active():
-            self._connect()
-        return self._client
-
-    def _connect(self) -> None:
-        """Establish SSH connection"""
-        self._client = paramiko.SSHClient()
-        self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    def _create_client(self) -> paramiko.SSHClient:
+        """Create and connect a new SSH client."""
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         connect_kwargs = {
             'hostname': self.host,
@@ -270,19 +264,14 @@ class SSHExecutor(ConnectionExecutor):
         elif self.password:
             connect_kwargs['password'] = self.password
 
-        self._client.connect(**connect_kwargs)
-
-    def _get_sftp(self) -> paramiko.SFTPClient:
-        """Get or create SFTP client"""
-        self._ensure_connected()
-        if self._sftp is None:
-            self._sftp = self._client.open_sftp()
-        return self._sftp
+        client.connect(**connect_kwargs)
+        return client
 
     def run_command(self, cmd: str, timeout: int = 30) -> Tuple[str, str, int]:
-        """Execute a command remotely via SSH"""
+        """Execute a command remotely via SSH (connects and disconnects)."""
+        client = None
         try:
-            client = self._ensure_connected()
+            client = self._create_client()
             stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
 
             exit_code = stdout.channel.recv_exit_status()
@@ -292,25 +281,41 @@ class SSHExecutor(ConnectionExecutor):
             return stdout_text, stderr_text, exit_code
         except Exception as e:
             return "", str(e), -1
+        finally:
+            if client:
+                client.close()
 
     def read_file(self, path: str) -> str:
-        """Read a remote file via SFTP"""
+        """Read a remote file via SFTP (connects and disconnects)."""
+        client = None
         try:
-            sftp = self._get_sftp()
+            client = self._create_client()
+            sftp = client.open_sftp()
             with sftp.open(path, 'r') as f:
-                return f.read().decode('utf-8', errors='replace')
+                content = f.read().decode('utf-8', errors='replace')
+            sftp.close()
+            return content
         except Exception as e:
             raise IOError(f"Failed to read remote file {path}: {e}")
+        finally:
+            if client:
+                client.close()
 
     def write_file(self, path: str, content: str) -> bool:
-        """Write to a remote file via SFTP"""
+        """Write to a remote file via SFTP (connects and disconnects)."""
+        client = None
         try:
-            sftp = self._get_sftp()
+            client = self._create_client()
+            sftp = client.open_sftp()
             with sftp.open(path, 'w') as f:
                 f.write(content.encode('utf-8'))
+            sftp.close()
             return True
         except Exception as e:
             raise IOError(f"Failed to write remote file {path}: {e}")
+        finally:
+            if client:
+                client.close()
 
     def file_exists(self, path: str) -> bool:
         """Check if remote file exists"""
@@ -330,74 +335,74 @@ class SSHExecutor(ConnectionExecutor):
         raise IOError(f"Failed to tail remote file {path}: {stderr}")
 
     def tail_file_follow(self, path: str, callback) -> None:
-        """Follow a remote file with tail -f"""
+        """Follow a remote file with tail -f.
+
+        Note: This keeps a connection open while following. Call stop_tail() to close.
+        """
         import threading
 
         self._tail_running = True
 
         def follow():
+            client = None
+            channel = None
             try:
-                client = self._ensure_connected()
+                client = self._create_client()
+                self._tail_client = client  # Store for stop_tail
                 transport = client.get_transport()
-                self._tail_channel = transport.open_session()
-                self._tail_channel.exec_command(f"tail -f '{path}'")
+                channel = transport.open_session()
+                channel.exec_command(f"tail -f '{path}'")
 
                 buffer = ""
                 while self._tail_running:
-                    if self._tail_channel.recv_ready():
-                        data = self._tail_channel.recv(4096).decode('utf-8', errors='replace')
+                    if channel.recv_ready():
+                        data = channel.recv(4096).decode('utf-8', errors='replace')
                         buffer += data
                         while '\n' in buffer:
                             line, buffer = buffer.split('\n', 1)
                             callback(line)
-                    elif self._tail_channel.exit_status_ready():
+                    elif channel.exit_status_ready():
                         break
                     else:
                         import time
                         time.sleep(0.1)
 
             except Exception as e:
-                callback(f"Error following remote file: {e}")
+                if self._tail_running:  # Only report if not intentionally stopped
+                    callback(f"Error following remote file: {e}")
             finally:
-                if self._tail_channel:
-                    self._tail_channel.close()
-                    self._tail_channel = None
+                if channel:
+                    try:
+                        channel.close()
+                    except:
+                        pass
+                if client:
+                    try:
+                        client.close()
+                    except:
+                        pass
+                self._tail_client = None
 
         self._tail_thread = threading.Thread(target=follow, daemon=True)
         self._tail_thread.start()
 
     def stop_tail(self) -> None:
-        """Stop the tail follow operation"""
+        """Stop the tail follow operation and close its connection."""
         self._tail_running = False
-        if self._tail_channel:
+        if self._tail_client:
             try:
-                self._tail_channel.close()
+                self._tail_client.close()
             except:
                 pass
-            self._tail_channel = None
+            self._tail_client = None
 
     def is_connected(self) -> bool:
-        """Check if SSH connection is active"""
-        if self._client is None:
-            return False
-        transport = self._client.get_transport()
-        return transport is not None and transport.is_active()
+        """Check if there's an active tail connection."""
+        return self._tail_client is not None
 
     def disconnect(self) -> None:
-        """Close SSH connection"""
+        """Stop any active operations."""
         self.stop_tail()
-        if self._sftp:
-            try:
-                self._sftp.close()
-            except:
-                pass
-            self._sftp = None
-        if self._client:
-            try:
-                self._client.close()
-            except:
-                pass
-            self._client = None
 
 
 def create_executor(connection_config: dict) -> ConnectionExecutor:

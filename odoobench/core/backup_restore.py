@@ -157,6 +157,116 @@ class OdooBench:
         # Default case: append filestore/db_name
         return os.path.join(normalized_path, 'filestore', db_name)
 
+    def list_databases(self, config):
+        """List all databases on the PostgreSQL server."""
+        env = os.environ.copy()
+        if config.get("db_password"):
+            env["PGPASSWORD"] = config["db_password"]
+
+        host = config.get("db_host") or "localhost"
+        port = config.get("db_port") or 5432
+        user = config.get("db_user") or "odoo"
+
+        cmd = [
+            "psql",
+            "-h", host,
+            "-p", str(port),
+            "-U", user,
+            "-d", "postgres",
+            "-t", "-A",
+            "-c", "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;",
+        ]
+
+        env["PGCONNECT_TIMEOUT"] = "5"
+
+        result = subprocess.run(
+            cmd, env=env, capture_output=True, text=True, timeout=10
+        )
+
+        if result.returncode != 0:
+            raise Exception(result.stderr.strip())
+
+        databases = [db.strip() for db in result.stdout.strip().split('\n') if db.strip()]
+        return databases
+
+    def get_pg_version(self, config):
+        """Get PostgreSQL server version."""
+        env = os.environ.copy()
+        if config.get("db_password"):
+            env["PGPASSWORD"] = config["db_password"]
+
+        host = config.get("db_host") or "localhost"
+        port = config.get("db_port") or 5432
+        user = config.get("db_user") or "odoo"
+
+        cmd = [
+            "psql",
+            "-h", host,
+            "-p", str(port),
+            "-U", user,
+            "-d", "postgres",
+            "-t", "-A",
+            "-c", "SELECT version();",
+        ]
+
+        env["PGCONNECT_TIMEOUT"] = "5"
+
+        result = subprocess.run(
+            cmd, env=env, capture_output=True, text=True, timeout=10
+        )
+
+        if result.returncode != 0:
+            raise Exception(result.stderr.strip())
+
+        return result.stdout.strip()
+
+    def get_pg_settings(self, config):
+        """Get important PostgreSQL settings."""
+        env = os.environ.copy()
+        if config.get("db_password"):
+            env["PGPASSWORD"] = config["db_password"]
+
+        host = config.get("db_host") or "localhost"
+        port = config.get("db_port") or 5432
+        user = config.get("db_user") or "odoo"
+
+        cmd = [
+            "psql",
+            "-h", host,
+            "-p", str(port),
+            "-U", user,
+            "-d", "postgres",
+            "-t", "-A", "-F", "|",
+            "-c", """SELECT name, setting, unit FROM pg_settings
+                     WHERE name IN ('max_connections', 'shared_buffers', 'work_mem',
+                                    'maintenance_work_mem', 'effective_cache_size',
+                                    'checkpoint_completion_target', 'wal_buffers',
+                                    'default_statistics_target', 'random_page_cost',
+                                    'effective_io_concurrency', 'max_worker_processes',
+                                    'max_parallel_workers_per_gather', 'max_parallel_workers')
+                     ORDER BY name;""",
+        ]
+
+        env["PGCONNECT_TIMEOUT"] = "5"
+
+        result = subprocess.run(
+            cmd, env=env, capture_output=True, text=True, timeout=10
+        )
+
+        if result.returncode != 0:
+            raise Exception(result.stderr.strip())
+
+        settings = []
+        for line in result.stdout.strip().split('\n'):
+            if line.strip():
+                parts = line.split('|')
+                if len(parts) >= 2:
+                    name = parts[0].strip()
+                    value = parts[1].strip()
+                    unit = parts[2].strip() if len(parts) > 2 else ""
+                    settings.append((name, value, unit))
+        return settings
+
     def test_connection(self, config):
         """Test database connection and filestore path"""
         messages = []
@@ -400,13 +510,42 @@ class OdooBench:
         - pg_dump runs locally on the server (fast localhost connection)
         - Output is compressed on the server (faster transfer)
         - Single compressed file transfer instead of streaming raw data
-        """
-        ssh_conn = self.conn_manager.get_ssh_connection(config["ssh_connection_id"])
-        if not ssh_conn:
-            self.log("Error: SSH connection not found, falling back to local pg_dump", "warning")
-            return self._backup_local_database(config)
 
-        self.log("Running pg_dump on remote server...")
+        If pg_ssh_host is configured, connects directly to the PostgreSQL server.
+        Otherwise, connects to the Odoo server and runs pg_dump from there.
+        """
+        # Check if we have direct SSH access to the PG server
+        pg_ssh_host = config.get("pg_ssh_host")
+        if pg_ssh_host:
+            # SSH directly to the PG server - pg_dump connects to localhost
+            pg_ssh_conn = {
+                "host": pg_ssh_host,
+                "port": config.get("pg_ssh_port") or 22,
+                "username": config.get("pg_ssh_username"),
+                "password": config.get("pg_ssh_password"),
+                "key_path": config.get("pg_ssh_key_path"),
+            }
+            # Validate we have credentials
+            if not pg_ssh_conn["username"]:
+                self.log("pg_ssh_host set but no pg_ssh_username, falling back to Odoo server", "warning")
+                pg_ssh_host = None
+            elif not pg_ssh_conn.get("password") and not pg_ssh_conn.get("key_path"):
+                self.log("pg_ssh_host set but no credentials, falling back to Odoo server", "warning")
+                pg_ssh_host = None
+
+        if pg_ssh_host:
+            ssh_conn = pg_ssh_conn
+            # When on the PG server, connect to localhost
+            dump_db_host = "localhost"
+            self.log(f"Running pg_dump on PostgreSQL server ({pg_ssh_host})...")
+        else:
+            # Fall back to Odoo server SSH
+            ssh_conn = self.conn_manager.get_ssh_connection(config["ssh_connection_id"])
+            if not ssh_conn:
+                self.log("Error: SSH connection not found, falling back to local pg_dump", "warning")
+                return self._backup_local_database(config)
+            dump_db_host = config.get("db_host", "localhost")
+            self.log(f"Running pg_dump on Odoo server (connecting to {dump_db_host})...")
 
         try:
             ssh = self._get_ssh_client(ssh_conn)
@@ -417,27 +556,50 @@ class OdooBench:
             local_dump = os.path.join(self.temp_dir, f"{config['db_name']}.sql")
 
             # Build pg_dump command to run on the remote server with gzip compression
-            db_host = config.get("db_host", "localhost")
             db_port = config.get("db_port", 5432)
             db_user = config.get("db_user", "odoo")
             db_name = config["db_name"]
             db_password = config.get("db_password", "")
 
-            # Set PGPASSWORD and run pg_dump with gzip compression
-            if db_password:
-                pg_dump_cmd = f"PGPASSWORD='{db_password}' pg_dump -h {db_host} -p {db_port} -U {db_user} -d {db_name} --no-owner --no-acl | gzip > {remote_dump}"
-            else:
-                pg_dump_cmd = f"pg_dump -h {db_host} -p {db_port} -U {db_user} -d {db_name} --no-owner --no-acl | gzip > {remote_dump}"
+            # Detect PostgreSQL server version and use matching pg_dump binary
+            # (only needed when running from Odoo server with potential version mismatch)
+            pg_dump_bin = "pg_dump"  # default
+            if not pg_ssh_host:
+                # Running from Odoo server - may need versioned pg_dump
+                version_cmd = f"psql -h {dump_db_host} -p {db_port} -U {db_user} -d {db_name} -t -c 'SHOW server_version_num;'"
+                if db_password:
+                    version_cmd = f"PGPASSWORD='{db_password}' {version_cmd}"
+                stdin, stdout, stderr = ssh.exec_command(f"bash -c \"{version_cmd}\"")
+                version_output = stdout.read().decode().strip()
+                if version_output and version_output.isdigit():
+                    major_version = int(version_output) // 10000
+                    versioned_bin = f"/usr/lib/postgresql/{major_version}/bin/pg_dump"
+                    # Check if versioned binary exists
+                    stdin, stdout, stderr = ssh.exec_command(f"test -x {versioned_bin} && echo yes")
+                    if stdout.read().decode().strip() == "yes":
+                        pg_dump_bin = versioned_bin
+                        self.log(f"Using PostgreSQL {major_version} pg_dump: {pg_dump_bin}")
 
-            self.log(f"Executing pg_dump on remote server (with compression)...")
-            stdin, stdout, stderr = ssh.exec_command(pg_dump_cmd)
+            # Set PGPASSWORD and run pg_dump with gzip compression
+            # Use pipefail so we get pg_dump's exit status, not gzip's
+            if db_password:
+                pg_dump_cmd = f"set -o pipefail; PGPASSWORD='{db_password}' {pg_dump_bin} -h {dump_db_host} -p {db_port} -U {db_user} -d {db_name} --no-owner --no-acl | gzip > {remote_dump}"
+            else:
+                pg_dump_cmd = f"set -o pipefail; {pg_dump_bin} -h {dump_db_host} -p {db_port} -U {db_user} -d {db_name} --no-owner --no-acl | gzip > {remote_dump}"
+
+            self.log(f"Executing pg_dump (with compression)...")
+            stdin, stdout, stderr = ssh.exec_command(f"bash -c '{pg_dump_cmd}'")
             exit_status = stdout.channel.recv_exit_status()
 
+            # Always check stderr for warnings/errors
+            error_msg = stderr.read().decode().strip()
+            if error_msg:
+                self.log(f"pg_dump stderr: {error_msg}", "warning")
+
             if exit_status != 0:
-                error_msg = stderr.read().decode()
-                self.log(f"Remote pg_dump failed: {error_msg}", "error")
+                self.log(f"Remote pg_dump failed with exit code {exit_status}", "error")
                 ssh.close()
-                raise Exception(f"Remote pg_dump failed: {error_msg}")
+                raise Exception(f"Remote pg_dump failed: {error_msg or 'unknown error'}")
 
             self.log("pg_dump completed, downloading compressed dump file...")
             self.update_progress(30, "Downloading database dump...")
